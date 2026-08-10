@@ -1185,6 +1185,159 @@ _relay_apply_shared_route_config() {
     fi
 }
 
+# 读取指定入口中可用于 auth_user 分流的规范化用户名。
+# 参数：
+#   $1 - 包含目标入口的配置文件路径。
+#   $2 - 目标入口 tag。
+# 输出：输出 JSON 字符串数组；VLESS 使用 UUID，AnyTLS 使用密码作为用户名。
+_relay_get_normalized_auth_users() {
+    local config_file="$1"
+    local inbound_tag="$2"
+
+    [ -f "$config_file" ] || {
+        printf '%s\n' '[]'
+        return 1
+    }
+    jq -c --arg it "$inbound_tag" '[
+        .inbounds[]? | select(.tag == $it) | .users[]?
+        | if has("uuid") then (.name // .uuid)
+          elif has("password") then
+              (if ((.name // "") == "" or .name == "default") then .password else .name end)
+          else (.name // empty) end
+        | select(. != null and . != "")
+    ]' "$config_file"
+}
+
+# 在主配置入口追加用户，并在中转配置中追加对应出口和认证路由。
+# 参数：
+#   $1 - 主配置文件路径，即入口实际所在的配置。
+#   $2 - 中转配置文件路径。
+#   $3 - 复用的入口 tag。
+#   $4 - 原入口用户的规范化用户名 JSON 数组。
+#   $5 - 新用户 JSON。
+#   $6 - 新出口 JSON。
+#   $7 - 新认证路由 JSON。
+#   $8 - 可选的原用户直连路由 JSON；不需要新增时传 null。
+# 输出：两份配置均修改成功时返回 0，否则返回 1；调用方负责根据备份回滚。
+_relay_apply_external_shared_route_config() {
+    local source_config_file="$1"
+    local relay_config_file="$2"
+    local inbound_tag="$3"
+    local existing_users_json="$4"
+    local user_json="$5"
+    local outbound_json="$6"
+    local rule_json="$7"
+    local base_rule_json="$8"
+    local source_temp="${source_config_file}.tmp"
+    local relay_temp="${relay_config_file}.tmp"
+
+    if ! jq -e --arg it "$inbound_tag" '.inbounds[]? | select(.tag == $it)' "$source_config_file" >/dev/null 2>&1; then
+        _error "主配置中找不到入口 ${inbound_tag}。"
+        return 1
+    fi
+
+    if ! jq --arg it "$inbound_tag" --argjson existing "$existing_users_json" --argjson user "$user_json" '
+        def matches_inbound($tag):
+            (.inbound == $tag) or ((.inbound | type) == "array" and (.inbound | index($tag)) != null);
+        (.inbounds[] | select(.tag == $it) | .users) |= map(
+            if has("uuid") then . + {name:(.name // .uuid)}
+            elif has("password") then . + {name:(if ((.name // "") == "" or .name == "default") then .password else .name end)}
+            else . end
+        )
+        | if (.route.rules? | type) == "array" then
+            .route.rules |= map(
+                if matches_inbound($it) and .auth_user == null then
+                    . + {auth_user:$existing, action:(.action // "route")}
+                else . end
+            )
+          else . end
+        | (.inbounds[] | select(.tag == $it) | .users) += [$user]
+    ' "$source_config_file" > "$source_temp"; then
+        rm -f "$source_temp" "$relay_temp"
+        _error "向主节点追加认证用户失败。"
+        return 1
+    fi
+    mv "$source_temp" "$source_config_file"
+
+    if jq --arg it "$inbound_tag" --argjson existing "$existing_users_json" --argjson outbound "$outbound_json" \
+        --argjson rule "$rule_json" --argjson base "$base_rule_json" '
+        def matches_inbound($tag):
+            (.inbound == $tag) or ((.inbound | type) == "array" and (.inbound | index($tag)) != null);
+        .route = (.route // {})
+        | .route.rules = (.route.rules // [])
+        | .outbounds = (.outbounds // [])
+        | .route.rules |= map(
+            if matches_inbound($it) and .auth_user == null then
+                . + {auth_user:$existing, action:(.action // "route")}
+            else . end
+        )
+        | if $base != null and ([.route.rules[] | select(matches_inbound($it))] | length) == 0 then
+            .route.rules += [$base]
+          else . end
+        | .outbounds = [$outbound] + .outbounds
+        | .route.rules += [$rule]
+    ' "$relay_config_file" > "$relay_temp"; then
+        mv "$relay_temp" "$relay_config_file"
+    else
+        rm -f "$relay_temp"
+        _error "写入主节点认证分流规则失败。"
+        return 1
+    fi
+}
+
+# 从主配置入口中精确删除一个由中转功能追加的认证用户。
+# 参数：
+#   $1 - 主配置文件路径。
+#   $2 - 目标入口 tag。
+#   $3 - 要删除的认证用户名。
+# 输出：修改成功时返回 0，否则返回 1；不会删除入口或其他用户。
+_relay_remove_external_auth_user() {
+    local source_config_file="$1"
+    local inbound_tag="$2"
+    local auth_user="$3"
+    local temp_file="${source_config_file}.tmp"
+
+    if jq --arg it "$inbound_tag" --arg au "$auth_user" '
+        def auth_identity:
+            if has("uuid") then (.name // .uuid)
+            elif has("password") then
+                (if ((.name // "") == "" or .name == "default") then .password else .name end)
+            else (.name // "") end;
+        (.inbounds[] | select(.tag == $it) | .users) |= map(select((auth_identity == $au) | not))
+    ' "$source_config_file" > "$temp_file"; then
+        mv "$temp_file" "$source_config_file"
+    else
+        rm -f "$temp_file"
+        _error "从主节点删除认证用户失败。"
+        return 1
+    fi
+}
+
+# 删除脚本为主节点原用户生成的临时直连基线规则。
+# 参数：
+#   $1 - 中转配置文件路径。
+#   $2 - 主节点入口 tag。
+# 输出：删除成功时返回 0，否则返回 1；不修改任何入口和出口。
+_relay_remove_external_base_route() {
+    local relay_config_file="$1"
+    local inbound_tag="$2"
+    local temp_file="${relay_config_file}.tmp"
+
+    if jq --arg it "$inbound_tag" '
+        def matches_inbound($tag):
+            (.inbound == $tag) or ((.inbound | type) == "array" and (.inbound | index($tag)) != null);
+        .route.rules = [
+            .route.rules[]? | select((matches_inbound($it) and .outbound == "direct") | not)
+        ]
+    ' "$relay_config_file" > "$temp_file"; then
+        mv "$temp_file" "$relay_config_file"
+    else
+        rm -f "$temp_file"
+        _error "删除主节点直连基线规则失败。"
+        return 1
+    fi
+}
+
 # 从中转配置中精确删除一条用户路由，并仅在无剩余规则时删除入口。
 # 参数：
 #   $1 - 中转配置文件路径。
@@ -1245,8 +1398,12 @@ _relay_check_combined_config() {
 _relay_select_shared_inbound() {
     local output_var="$1"
     local inbounds=""
+    local relay_inbounds=""
+    local main_inbounds=""
     local inbound=""
     local inbound_type=""
+    local source_config=""
+    local source_label=""
     local listen_port=""
     local user_count=""
     local index=1
@@ -1254,19 +1411,51 @@ _relay_select_shared_inbound() {
     local inbound_list=()
 
     [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
-    inbounds=$(jq -c '.inbounds[]? | select(
-        (.type == "vless" and .tls.reality.enabled == true) or
-        (.type == "anytls" and .tls.enabled == true)
-    )' "$RELAY_CONFIG_FILE" 2>/dev/null)
+    if [ -f "$RELAY_CONFIG_FILE" ] && jq -e '.inbounds | type == "array"' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+        relay_inbounds=$(jq -c --arg source "relay" '
+            .inbounds[]? | select(
+                ((.type // "" | ascii_downcase) == "vless" and (
+                    ((.tls.reality.enabled // false | tostring) == "true") or
+                    ((.tag // "") | test("reality"; "i"))
+                )) or
+                ((.type // "" | ascii_downcase) == "anytls")
+            ) | . + {_source_config:$source}
+        ' "$RELAY_CONFIG_FILE" 2>/dev/null)
+    fi
+    if [ -f "$MAIN_CONFIG_FILE" ] && jq -e '.inbounds | type == "array"' "$MAIN_CONFIG_FILE" >/dev/null 2>&1; then
+        main_inbounds=$(jq -c --arg source "main" '
+            .inbounds[]? | select(
+                ((.type // "" | ascii_downcase) == "vless" and (
+                    ((.tls.reality.enabled // false | tostring) == "true") or
+                    ((.tag // "") | test("reality"; "i"))
+                )) or
+                ((.type // "" | ascii_downcase) == "anytls")
+            ) | . + {_source_config:$source}
+        ' "$MAIN_CONFIG_FILE" 2>/dev/null)
+    fi
+    inbounds=$(printf '%s\n%s\n' "$relay_inbounds" "$main_inbounds" | sed '/^[[:space:]]*$/d')
     if [ -z "$inbounds" ]; then
-        _warn "暂无可复用的 VLESS-Reality、AnyTLS 或 Any-Reality 中转入口。"
+        _warn "主配置和中转配置中暂无可复用的 VLESS-Reality、AnyTLS 或 Any-Reality 入口。"
+        local existing_summary=""
+        if [ -f "$RELAY_CONFIG_FILE" ]; then
+            existing_summary=$(jq -r '.inbounds[]? | "中转配置: \(.tag // "未命名") [\(.type // "未知类型")]"' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        fi
+        if [ -f "$MAIN_CONFIG_FILE" ]; then
+            existing_summary="${existing_summary}"$'\n'"$(jq -r '.inbounds[]? | "主节点: \(.tag // "未命名") [\(.type // "未知类型")]"' "$MAIN_CONFIG_FILE" 2>/dev/null)"
+        fi
+        if [ -n "$existing_summary" ]; then
+            _info "当前中转入口如下，但协议不支持按 UUID 复用："
+            while IFS= read -r inbound; do
+                [ -n "$inbound" ] && echo "    - ${inbound}"
+            done <<< "$existing_summary"
+        fi
         return 1
     fi
 
     echo -e "\n  ${CYAN}【选择要复用的认证入口】${NC}"
     while IFS= read -r inbound; do
         [ -n "$inbound" ] || continue
-        if [ "$(echo "$inbound" | jq -r '.type')" == "vless" ]; then
+        if [ "$(echo "$inbound" | jq -r '.type | ascii_downcase')" == "vless" ]; then
             inbound_type="VLESS-Reality"
         elif [ "$(echo "$inbound" | jq -r '.tls.reality.enabled // false')" == "true" ]; then
             inbound_type="Any-Reality"
@@ -1275,7 +1464,9 @@ _relay_select_shared_inbound() {
         fi
         listen_port=$(echo "$inbound" | jq -r '.listen_port')
         user_count=$(echo "$inbound" | jq -r '.users | length')
-        echo -e "    ${GREEN}[$index]${NC} ${inbound_type} 端口 ${listen_port}（${user_count} 个用户）"
+        source_config=$(echo "$inbound" | jq -r '._source_config // "relay"')
+        [ "$source_config" == "main" ] && source_label="主节点" || source_label="中转配置"
+        echo -e "    ${GREEN}[$index]${NC} ${inbound_type} 端口 ${listen_port}（${user_count} 个用户，${source_label}）"
         inbound_list+=("$inbound")
         ((index++))
     done <<< "$inbounds"
@@ -1322,9 +1513,14 @@ _relay_add_shared_auth_route() {
     local listen_port=""
     local reality_enabled="false"
     local relay_type=""
+    local source_config="relay"
+    local source_config_file=""
+    local existing_users_json='[]'
     local auth_user=""
     local user_json=""
     local existing_outbound_tag=""
+    local base_rule_json="null"
+    local base_route_owned="false"
     local outbound_tag=""
     local route_count=0
     local node_name=""
@@ -1335,6 +1531,7 @@ _relay_add_shared_auth_route() {
     local server_name=""
     local short_id=""
     local public_key=""
+    local metadata_short_id=""
     local existing_metadata=""
     local existing_link=""
     local link=""
@@ -1342,11 +1539,18 @@ _relay_add_shared_auth_route() {
     local links_file="${RELAY_AUX_DIR}/relay_links.json"
     local config_backup="${RELAY_CONFIG_FILE}.auth-route.bak"
     local links_backup="${links_file}.auth-route.bak"
+    local source_backup="${MAIN_CONFIG_FILE}.auth-route.bak"
 
     _relay_select_shared_inbound selected_inbound || return 1
-    IFS=$'\t' read -r inbound_tag inbound_type listen_port reality_enabled <<< "$(
-        echo "$selected_inbound" | jq -r '[.tag, .type, (.listen_port|tostring), (.tls.reality.enabled // false | tostring)] | @tsv'
+    IFS=$'\t' read -r inbound_tag inbound_type listen_port reality_enabled source_config <<< "$(
+        echo "$selected_inbound" | jq -r '[.tag, .type, (.listen_port|tostring), (.tls.reality.enabled // false | tostring), (._source_config // "relay")] | @tsv'
     )"
+    if [ "$source_config" == "main" ]; then
+        source_config_file="$MAIN_CONFIG_FILE"
+    else
+        source_config="relay"
+        source_config_file="$RELAY_CONFIG_FILE"
+    fi
     if [ "$inbound_type" == "vless" ]; then
         relay_type="vless-reality"
     elif [ "$reality_enabled" == "true" ]; then
@@ -1355,14 +1559,38 @@ _relay_add_shared_auth_route() {
         relay_type="anytls"
     fi
 
+    existing_users_json=$(_relay_get_normalized_auth_users "$source_config_file" "$inbound_tag") || return 1
+
     existing_outbound_tag=$(jq -r --arg it "$inbound_tag" '
         [.route.rules[]? | select(
             (.inbound == $it) or ((.inbound | type) == "array" and (.inbound | index($it)) != null)
         )][0].outbound // empty
     ' "$RELAY_CONFIG_FILE")
-    if [ -z "$existing_outbound_tag" ]; then
+    if [ -z "$existing_outbound_tag" ] && [ "$source_config" == "main" ]; then
+        existing_outbound_tag=$(jq -r --arg it "$inbound_tag" '
+            [.route.rules[]? | select(
+                (.inbound == $it) or ((.inbound | type) == "array" and (.inbound | index($it)) != null)
+            )][0].outbound // empty
+        ' "$MAIN_CONFIG_FILE")
+    fi
+    if [ -z "$existing_outbound_tag" ] && [ "$source_config" == "main" ]; then
+        existing_outbound_tag="direct"
+        base_rule_json=$(jq -n --arg it "$inbound_tag" --argjson users "$existing_users_json" \
+            '{inbound:$it,auth_user:$users,action:"route",outbound:"direct"}')
+        base_route_owned="true"
+    elif [ -z "$existing_outbound_tag" ]; then
         _error "入口 ${inbound_tag} 没有可迁移的现有路由，无法安全复用。"
         return 1
+    elif [ "$source_config" == "main" ] && [ -f "$links_file" ]; then
+        base_route_owned=$(jq -r --arg it "$inbound_tag" '
+            [to_entries[]?
+             | select((.value | type) == "object")
+             | select((.value.inbound_tag // "") == $it)
+             | select((.value.source_config // "relay") == "main")
+             | select((.value.base_route_owned // false) == true)]
+            | length > 0
+        ' "$links_file" 2>/dev/null)
+        [ "$base_route_owned" == "true" ] || base_route_owned="false"
     fi
 
     if [ "$relay_type" == "vless-reality" ]; then
@@ -1382,14 +1610,14 @@ _relay_add_shared_auth_route() {
     if jq -e --arg it "$inbound_tag" --arg au "$auth_user" '
         .inbounds[] | select(.tag == $it) | .users[]?
         | select((.name // "") == $au or (.uuid // "") == $au or (.password // "") == $au)
-    ' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+    ' "$source_config_file" >/dev/null 2>&1; then
         _error "认证用户 ${auth_user} 已存在于入口 ${inbound_tag}。"
         return 1
     fi
 
     route_count=$(jq -r --arg it "$inbound_tag" '[.route.rules[]? | select(
         (.inbound == $it) or ((.inbound | type) == "array" and (.inbound | index($it)) != null)
-    )] | length' "$RELAY_CONFIG_FILE")
+    ) | select((.outbound // "") | startswith("relay-out-"))] | length' "$RELAY_CONFIG_FILE")
     default_name="${dest_type}-Shared-${listen_port}-u$((route_count+1))"
     read -r -p "  请输入节点名称 (回车: ${default_name}): " node_name
     [ -n "$node_name" ] || node_name="$default_name"
@@ -1412,9 +1640,15 @@ _relay_add_shared_auth_route() {
     existing_link=$(echo "$existing_metadata" | jq -r '.link // empty' 2>/dev/null)
     if [ "$reality_enabled" == "true" ]; then
         short_id=$(echo "$selected_inbound" | jq -r '.tls.reality.short_id[0] // empty')
-        public_key=$(printf '%s\n' "$existing_link" | sed -n 's/.*[?&]pbk=\([^&#]*\).*/\1/p')
+        if [ "$source_config" == "main" ] && [ -f "$MAIN_METADATA_FILE" ]; then
+            IFS=$'\t' read -r public_key metadata_short_id <<< "$(jq -r --arg t "$inbound_tag" \
+                '.[$t] | [(.publicKey // ""), (.shortId // "")] | @tsv' "$MAIN_METADATA_FILE" 2>/dev/null)"
+            [ -n "$short_id" ] || short_id="$metadata_short_id"
+        else
+            public_key=$(printf '%s\n' "$existing_link" | sed -n 's/.*[?&]pbk=\([^&#]*\).*/\1/p')
+        fi
         if [ -z "$public_key" ] || [ -z "$short_id" ]; then
-            _error "旧入口缺少 Reality public_key/short_id 元数据，无法生成新增用户链接。"
+            _error "入口 ${inbound_tag} 缺少 Reality public_key/short_id 元数据，无法生成新增用户链接。"
             return 1
         fi
     fi
@@ -1443,9 +1677,12 @@ _relay_add_shared_auth_route() {
     local metadata=""
     metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
         --arg landing_type "$dest_type" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" --arg auth_user "$auth_user" \
-        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,auth_user:$auth_user}')
+        --arg source_config "$source_config" --argjson base_route_owned "$base_route_owned" \
+        '{link:$link,created_at:$created,relay_type:$relay_type,landing_type:$landing_type,landing_addr:$landing_addr,node_name:$node_name,
+          auth_user:$auth_user,source_config:$source_config,base_route_owned:$base_route_owned}')
 
-    rm -f "$config_backup" "$links_backup"
+    rm -f "$config_backup" "$links_backup" "$source_backup"
+    [ -f "$links_file" ] || printf '%s\n' '{}' > "$links_file"
     cp "$RELAY_CONFIG_FILE" "$config_backup" || {
         _error "无法备份中转配置。"
         return 1
@@ -1455,25 +1692,39 @@ _relay_add_shared_auth_route() {
         _error "无法备份中转链接元数据。"
         return 1
     }
+    if [ "$source_config" == "main" ] && ! cp "$MAIN_CONFIG_FILE" "$source_backup"; then
+        rm -f "$config_backup" "$links_backup"
+        _error "无法备份主节点配置。"
+        return 1
+    fi
 
-    if ! _relay_apply_shared_route_config "$RELAY_CONFIG_FILE" "$inbound_tag" "$user_json" "$outbound_json" "$rule_json" ||
-       ! _relay_migrate_legacy_metadata "$inbound_tag" "$existing_outbound_tag" ||
-       ! _relay_store_route_metadata "$inbound_tag" "$outbound_tag" "$metadata"; then
+    local apply_succeeded="false"
+    if [ "$source_config" == "main" ]; then
+        _relay_apply_external_shared_route_config "$MAIN_CONFIG_FILE" "$RELAY_CONFIG_FILE" "$inbound_tag" \
+            "$existing_users_json" "$user_json" "$outbound_json" "$rule_json" "$base_rule_json" && apply_succeeded="true"
+    elif _relay_apply_shared_route_config "$RELAY_CONFIG_FILE" "$inbound_tag" "$user_json" "$outbound_json" "$rule_json" &&
+         _relay_migrate_legacy_metadata "$inbound_tag" "$existing_outbound_tag"; then
+        apply_succeeded="true"
+    fi
+    if [ "$apply_succeeded" != "true" ] || ! _relay_store_route_metadata "$inbound_tag" "$outbound_tag" "$metadata"; then
         _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$source_backup" ] && mv "$source_backup" "$MAIN_CONFIG_FILE"
         return 1
     fi
     if ! _relay_check_combined_config "$RELAY_CONFIG_FILE"; then
         _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$source_backup" ] && mv "$source_backup" "$MAIN_CONFIG_FILE"
         _error "新增用户分流配置检查失败，已恢复原配置。"
         return 1
     fi
     if ! _manage_service restart; then
         _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$source_backup" ] && mv "$source_backup" "$MAIN_CONFIG_FILE"
         _manage_service restart >/dev/null 2>&1 || true
         _error "中转服务重启失败，已恢复原配置。"
         return 1
     fi
-    rm -f "$config_backup" "$links_backup"
+    rm -f "$config_backup" "$links_backup" "$source_backup"
 
     if [ -n "$proxy_json" ]; then
         _add_node_to_relay_yaml "$proxy_json" || _warn "分流已生效，但写入 Clash YAML 失败。"
@@ -1524,29 +1775,34 @@ _finalize_relay_setup() {
     _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
     
     # --- 选择中转入口协议 ---
-    echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"
-    echo -e "    ${GREEN}[1]${NC} VLESS-Reality"
-    echo -e "    ${GREEN}[2]${NC} Hysteria2"
-    echo -e "    ${GREEN}[3]${NC} TUICv5"
-    echo -e "    ${GREEN}[4]${NC} AnyTLS"
-    echo -e "    ${GREEN}[5]${NC} Any-Reality"
-    echo -e "    ${GREEN}[6]${NC} 复用已有 Reality/AnyTLS 入口（按 UUID 分流）"
-    echo ""
-    read -p "  请输入选项 [1-6]: " relay_choice
-    
     local relay_type=""
-    case "$relay_choice" in
-        1) relay_type="vless-reality" ;;
-        2) relay_type="hysteria2" ;;
-        3) relay_type="tuic" ;;
-        4) relay_type="anytls" ;;
-        5) relay_type="any-reality" ;;
-        6)
-            _relay_add_shared_auth_route "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
-            return $?
-            ;;
-        *) _error "无效选项"; return ;;
-    esac
+    local relay_choice=""
+    while true; do
+        echo -e "\n  ${CYAN}【请选择本机的 [中转入口] 协议】${NC}"
+        echo -e "    ${GREEN}[1]${NC} VLESS-Reality"
+        echo -e "    ${GREEN}[2]${NC} Hysteria2"
+        echo -e "    ${GREEN}[3]${NC} TUICv5"
+        echo -e "    ${GREEN}[4]${NC} AnyTLS"
+        echo -e "    ${GREEN}[5]${NC} Any-Reality"
+        echo -e "    ${GREEN}[6]${NC} 复用已有 Reality/AnyTLS 入口（按 UUID 分流）"
+        echo ""
+        read -r -p "  请输入选项 [1-6]: " relay_choice
+        case "$relay_choice" in
+            1) relay_type="vless-reality"; break ;;
+            2) relay_type="hysteria2"; break ;;
+            3) relay_type="tuic"; break ;;
+            4) relay_type="anytls"; break ;;
+            5) relay_type="any-reality"; break ;;
+            6)
+                if _relay_add_shared_auth_route "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"; then
+                    return 0
+                fi
+                echo ""
+                read -r -p "  复用入口未完成，按回车重新选择入口协议..."
+                ;;
+            *) _error "无效选项，请重新输入。" ;;
+        esac
+    done
     
     # --- 配置入口详细信息 ---
     while true; do
@@ -1974,6 +2230,7 @@ _view_relays() {
         local landing_info="--"
         local node_name="未知节点"
         local relay_type="--"
+        local source_label="中转配置"
         
         if [ -f "$LINKS_FILE" ]; then
             metadata=$(_relay_get_route_metadata "$in_tag" "$out_tag")
@@ -1983,6 +2240,7 @@ _view_relays() {
                     landing_info=$(echo "$metadata" | jq -r '.landing_addr // "未知"')
                     node_name=$(echo "$metadata" | jq -r '.node_name // "未知节点"')
                     relay_type=$(echo "$metadata" | jq -r '.relay_type // "--"')
+                    [ "$(echo "$metadata" | jq -r '.source_config // "relay"')" == "main" ] && source_label="主节点"
                 else
                     link="$metadata"
                 fi
@@ -1991,6 +2249,7 @@ _view_relays() {
 
         echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${node_name}${NC}"
         echo -e "      入口索引: ${CYAN}${in_tag}${NC}"
+        echo -e "      入口来源: ${source_label}"
         echo -e "      认证用户: ${GREEN}${auth_user}${NC}"
         echo -e "      中转方式: ${relay_type}"
         echo -e "      落地目标: ${landing_info}"
@@ -2022,32 +2281,91 @@ _relay_remove_owned_certificates() {
 # 输出：清理中转配置、元数据、YAML 节点、证书和端口跳跃规则。
 _clear_all_relays() {
     local links_file="${RELAY_AUX_DIR}/relay_links.json"
+    local config_backup="${RELAY_CONFIG_FILE}.clear-all.bak"
+    local links_backup="${links_file}.clear-all.bak"
+    local main_backup="${MAIN_CONFIG_FILE}.clear-relay-users.bak"
+    local cleanup_failed="false"
 
-    if [ -f "$links_file" ]; then
+    [ -f "$RELAY_CONFIG_FILE" ] || printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
+    [ -f "$links_file" ] || printf '%s\n' '{}' > "$links_file"
+    rm -f "$config_backup" "$links_backup" "$main_backup"
+    cp "$RELAY_CONFIG_FILE" "$config_backup" || {
+        _error "无法备份中转配置。"
+        return 1
+    }
+    cp "$links_file" "$links_backup" || {
+        rm -f "$config_backup"
+        _error "无法备份中转元数据。"
+        return 1
+    }
+    if [ -f "$MAIN_CONFIG_FILE" ] && ! cp "$MAIN_CONFIG_FILE" "$main_backup"; then
+        rm -f "$config_backup" "$links_backup"
+        _error "无法备份主节点配置。"
+        return 1
+    fi
+
+    if [ -f "$MAIN_CONFIG_FILE" ]; then
+        while IFS=$'\t' read -r inbound_tag auth_user; do
+            [ -n "$inbound_tag" ] && [ -n "$auth_user" ] || continue
+            if ! _relay_remove_external_auth_user "$MAIN_CONFIG_FILE" "$inbound_tag" "$auth_user"; then
+                cleanup_failed="true"
+                break
+            fi
+        done < <(jq -r '
+            to_entries[]?
+            | select((.value | type) == "object")
+            | select((.value.source_config // "relay") == "main")
+            | [(.value.inbound_tag // ""), (.value.auth_user // "")] | @tsv
+        ' "$links_backup" 2>/dev/null)
+    fi
+
+    if [ "$cleanup_failed" == "true" ]; then
+        _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
+        _error "清理主节点附加认证用户失败，已恢复原配置。"
+        return 1
+    fi
+
+    printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
+    printf '%s\n' '{}' > "$links_file"
+    if ! _relay_check_combined_config "$RELAY_CONFIG_FILE"; then
+        _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
+        _error "清空后的配置检查失败，已恢复原配置。"
+        return 1
+    fi
+    if ! _manage_service restart; then
+        _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
+        _manage_service restart >/dev/null 2>&1 || true
+        _error "清空后服务重启失败，已恢复原配置。"
+        return 1
+    fi
+
+    if [ -f "$links_backup" ]; then
         while IFS='|' read -r relay_tag hop_range; do
             [ -n "$relay_tag" ] || continue
             local port_suffix="${relay_tag##*-}"
             local hop_start="${hop_range%-*}"
             local hop_end="${hop_range#*-}"
             _nft_apply_redirect_rule delete "$hop_start" "$hop_end" "$port_suffix" "singboxlite-relay-hop-${relay_tag}"
-        done < <(jq -r 'to_entries[] | select(.value.port_hopping) | "\(.value.inbound_tag // .key)|\(.value.port_hopping)"' "$links_file" 2>/dev/null)
+        done < <(jq -r '
+            to_entries[]
+            | select((.value | type) == "object" and .value.port_hopping)
+            | "\(.value.inbound_tag // .key)|\(.value.port_hopping)"
+        ' "$links_backup" 2>/dev/null)
         _save_nftables_rules 2>/dev/null || true
 
         while IFS= read -r node_name; do
             [ -n "$node_name" ] && _remove_node_from_relay_yaml "$node_name"
-        done < <(jq -r '[to_entries[] | .value.node_name // empty] | unique[]' "$links_file" 2>/dev/null)
+        done < <(jq -r '[
+            to_entries[] | select((.value | type) == "object") | .value.node_name // empty
+        ] | unique[]' "$links_backup" 2>/dev/null)
     fi
 
-    _relay_remove_owned_certificates "$RELAY_CONFIG_FILE"
-    printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
-    printf '%s\n' '{}' > "$links_file"
-
-    if _manage_service restart; then
-        _success "全部中转已清空"
-    else
-        _error "中转配置已清空，但服务重启失败，请检查服务状态。"
-        return 1
-    fi
+    _relay_remove_owned_certificates "$config_backup"
+    rm -f "$config_backup" "$links_backup" "$main_backup"
+    _success "全部中转已清空，主节点中由中转功能追加的认证用户也已移除。"
 }
 
 # 交互删除单条或全部中转路由。
@@ -2130,35 +2448,60 @@ _delete_relay() {
     local metadata=$(_relay_get_route_metadata "$in_tag" "$out_tag")
     local node_name_yaml=$(echo "$metadata" | jq -r '.node_name // empty' 2>/dev/null)
     local port_hopping=$(echo "$metadata" | jq -r '.port_hopping // empty' 2>/dev/null)
+    local source_config=$(echo "$metadata" | jq -r '.source_config // "relay"' 2>/dev/null)
+    local base_route_owned=$(echo "$metadata" | jq -r '.base_route_owned // false' 2>/dev/null)
     local port_suffix=$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONFIG_FILE")
     local config_backup="${CONFIG_FILE}.delete-route.bak"
     local links_backup="${LINKS_FILE}.delete-route.bak"
+    local main_backup="${MAIN_CONFIG_FILE}.delete-relay-user.bak"
 
     _info "正在删除中转链路: $in_tag -> $out_tag ..."
-    rm -f "$config_backup" "$links_backup"
+    rm -f "$config_backup" "$links_backup" "$main_backup"
     cp "$CONFIG_FILE" "$config_backup" || { _error "无法备份中转配置。"; return 1; }
     cp "$LINKS_FILE" "$links_backup" || { rm -f "$config_backup"; _error "无法备份中转元数据。"; return 1; }
+    if [ "$source_config" == "main" ] && ! cp "$MAIN_CONFIG_FILE" "$main_backup"; then
+        rm -f "$config_backup" "$links_backup"
+        _error "无法备份主节点配置。"
+        return 1
+    fi
 
     if ! _relay_remove_route_config "$CONFIG_FILE" "$in_tag" "$out_tag" "$auth_user" ||
+       { [ "$source_config" == "main" ] && ! _relay_remove_external_auth_user "$MAIN_CONFIG_FILE" "$in_tag" "$auth_user"; } ||
        ! _relay_delete_route_metadata "$in_tag" "$out_tag"; then
         _relay_restore_auth_route_files "$CONFIG_FILE" "$config_backup" "$LINKS_FILE" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
         return 1
+    fi
+    if [ "$source_config" == "main" ] && [ "$base_route_owned" == "true" ] &&
+       ! jq -e --arg it "$in_tag" '
+           .route.rules[]? | select(
+               ((.inbound == $it) or ((.inbound | type) == "array" and (.inbound | index($it)) != null)) and
+               ((.outbound // "") | startswith("relay-out-"))
+           )
+       ' "$CONFIG_FILE" >/dev/null 2>&1; then
+        if ! _relay_remove_external_base_route "$CONFIG_FILE" "$in_tag"; then
+            _relay_restore_auth_route_files "$CONFIG_FILE" "$config_backup" "$LINKS_FILE" "$links_backup"
+            [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
+            return 1
+        fi
     fi
     if ! _relay_check_combined_config "$CONFIG_FILE"; then
         _relay_restore_auth_route_files "$CONFIG_FILE" "$config_backup" "$LINKS_FILE" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
         _error "删除后的配置检查失败，已恢复原配置。"
         return 1
     fi
     if ! _manage_service restart; then
         _relay_restore_auth_route_files "$CONFIG_FILE" "$config_backup" "$LINKS_FILE" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
         _manage_service restart >/dev/null 2>&1 || true
         _error "删除后服务重启失败，已恢复原配置。"
         return 1
     fi
-    rm -f "$config_backup" "$links_backup"
+    rm -f "$config_backup" "$links_backup" "$main_backup"
 
     [ -n "$node_name_yaml" ] && _remove_node_from_relay_yaml "$node_name_yaml"
-    if ! jq -e --arg t "$in_tag" '.inbounds[]? | select(.tag == $t)' "$CONFIG_FILE" >/dev/null 2>&1; then
+    if [ "$source_config" != "main" ] && ! jq -e --arg t "$in_tag" '.inbounds[]? | select(.tag == $t)' "$CONFIG_FILE" >/dev/null 2>&1; then
         if [ -n "$port_hopping" ]; then
             local hop_start="${port_hopping%-*}"
             local hop_end="${port_hopping#*-}"
@@ -2180,7 +2523,14 @@ _modify_relay_port() {
 
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    local rules=$(jq -c '[.route.rules[] | select(.inbound != null and .outbound != null)] | unique_by(.inbound | tostring)[]' "$CONFIG_FILE" 2>/dev/null)
+    local rules=$(jq -c '
+        [.inbounds[]?.tag] as $inbound_tags
+        | [.route.rules[]? | select(
+            .inbound != null and .outbound != null and
+            (.inbound as $tag | $inbound_tags | index($tag) != null)
+        )]
+        | unique_by(.inbound | tostring)[]
+    ' "$CONFIG_FILE" 2>/dev/null)
 
     if [ -z "$rules" ]; then
         _warn "没有可修改的中转路由。"
@@ -3498,7 +3848,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v17)                  ║"
+        echo "  ║                (v18)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 

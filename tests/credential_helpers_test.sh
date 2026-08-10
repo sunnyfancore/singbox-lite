@@ -219,10 +219,12 @@ relay_setup_function=$(declare -f _finalize_relay_setup)
 [[ "$relay_setup_function" == *'if $padding != null then .padding_scheme = $padding else . end'* ]] || fail 'AnyTLS relay does not omit padding_scheme for the core default'
 [[ "$relay_setup_function" == *'"auth_user":[$au]'* ]] || fail 'new relay routes do not match auth_user'
 [[ "$relay_setup_function" == *'relay_type="any-reality"'* ]] || fail 'Any-Reality relay entrance is missing'
+[[ "$relay_setup_function" == *'复用入口未完成，按回车重新选择入口协议'* ]] || fail 'failed entrance reuse still exits directly to the menu'
 
 shared_route_function=$(declare -f _relay_add_shared_auth_route)
 [[ "$shared_route_function" == *'_relay_select_shared_inbound selected_inbound'* ]] || fail 'shared auth routing does not select an existing entrance'
 [[ "$shared_route_function" == *'_relay_apply_shared_route_config'* ]] || fail 'shared auth routing does not append a user route'
+[[ "$shared_route_function" == *'_relay_apply_external_shared_route_config'* ]] || fail 'shared auth routing does not support entrances from the main configuration'
 [[ "$shared_route_function" == *'_relay_check_combined_config'* ]] || fail 'shared auth routing does not validate the combined configuration'
 
 rollback_config="${TEST_TMP}/relay-rollback.json"
@@ -243,6 +245,7 @@ clear_relays_function=$(declare -f _clear_all_relays)
 [[ "$clear_relays_function" != *'*.pem'* ]] || fail 'relay deletion still removes all shared certificates'
 [[ "$clear_relays_function" != *'.proxies = []'* ]] || fail 'relay deletion still clears all shared YAML proxies'
 [[ "$clear_relays_function" == *'_relay_remove_owned_certificates'* ]] || fail 'relay deletion does not scope certificates by tag'
+[[ "$clear_relays_function" == *'_relay_remove_external_auth_user'* ]] || fail 'relay deletion leaves shared UUID users in the main configuration'
 
 main_reality_function=$(declare -f _add_vless_reality)
 [[ "$main_reality_function" == *'"name":$u,"uuid":$u'* ]] || fail 'main VLESS-Reality name does not match UUID'
@@ -366,5 +369,155 @@ resolved_metadata=$(_relay_get_route_metadata 'vless-reality-in-20001' 'relay-ou
 assert_eq 'new-user' "$(echo "$resolved_metadata" | jq -r '.auth_user')" 'route metadata lookup by outbound'
 _relay_delete_route_metadata 'vless-reality-in-20001' 'relay-out-20001-u2'
 jq -e '.["relay-out-20001"] != null and .["relay-out-20001-u2"] == null' "$relay_links_file" >/dev/null || fail 'deleting one route metadata entry removed another route'
+
+external_main_config="${TEST_TMP}/main-vless-reality.json"
+external_relay_config="${TEST_TMP}/relay-for-main-vless.json"
+external_old_uuid='99999999-9999-4999-8999-999999999999'
+external_new_uuid='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+cat > "$external_main_config" <<EOF
+{
+  "inbounds": [{
+    "type": "vless",
+    "tag": "vless-reality-in-22001",
+    "listen_port": 22001,
+    "users": [{"uuid": "$external_old_uuid", "flow": "xtls-rprx-vision"}],
+    "tls": {"enabled": true, "reality": {"enabled": true, "short_id": ["0123456789abcdef"]}}
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"rules": []}
+}
+EOF
+cat > "$external_relay_config" <<'EOF'
+{"inbounds":[],"outbounds":[],"route":{"rules":[]}}
+EOF
+external_existing_users=$(_relay_get_normalized_auth_users "$external_main_config" 'vless-reality-in-22001')
+assert_eq "[\"$external_old_uuid\"]" "$external_existing_users" 'main VLESS normalized auth users'
+external_user=$(jq -n --arg u "$external_new_uuid" '{name:$u,uuid:$u,flow:"xtls-rprx-vision"}')
+external_outbound=$(jq -n '{type:"direct",tag:"relay-out-22001"}')
+external_rule=$(jq -n --arg u "$external_new_uuid" '{inbound:"vless-reality-in-22001",auth_user:[$u],action:"route",outbound:"relay-out-22001"}')
+external_base_rule=$(jq -n --arg u "$external_old_uuid" '{inbound:"vless-reality-in-22001",auth_user:[$u],action:"route",outbound:"direct"}')
+_relay_apply_external_shared_route_config "$external_main_config" "$external_relay_config" 'vless-reality-in-22001' \
+    "$external_existing_users" "$external_user" "$external_outbound" "$external_rule" "$external_base_rule"
+jq -e --arg old "$external_old_uuid" --arg new "$external_new_uuid" '
+    [.inbounds[0].users[].name] | sort == ([$old,$new] | sort)
+' "$external_main_config" >/dev/null || fail 'main VLESS entrance did not retain the original UUID and append the shared UUID'
+jq -e --arg old "$external_old_uuid" --arg new "$external_new_uuid" '
+    (.route.rules[] | select(.outbound == "direct") | .auth_user == [$old]) and
+    (.route.rules[] | select(.outbound == "relay-out-22001") | .auth_user == [$new])
+' "$external_relay_config" >/dev/null || fail 'main VLESS auth users were not split between direct and relay routes'
+
+_relay_remove_route_config "$external_relay_config" 'vless-reality-in-22001' 'relay-out-22001' "$external_new_uuid"
+_relay_remove_external_auth_user "$external_main_config" 'vless-reality-in-22001' "$external_new_uuid"
+_relay_remove_external_base_route "$external_relay_config" 'vless-reality-in-22001'
+jq -e --arg old "$external_old_uuid" '
+    .inbounds[0].users == [{name:$old,uuid:$old,flow:"xtls-rprx-vision"}]
+' "$external_main_config" >/dev/null || fail 'deleting a shared UUID changed the original main VLESS user'
+jq -e '.outbounds == [] and .route.rules == []' "$external_relay_config" >/dev/null || fail 'deleting the final shared UUID left relay routing configuration behind'
+
+MAIN_CONFIG_FILE="$external_main_config"
+RELAY_CONFIG_FILE="$external_relay_config"
+selected_shared_inbound=''
+_relay_select_shared_inbound selected_shared_inbound <<< $'1\n' >/dev/null
+assert_eq 'vless-reality-in-22001' "$(echo "$selected_shared_inbound" | jq -r '.tag')" 'main VLESS-Reality entrance selection'
+assert_eq 'main' "$(echo "$selected_shared_inbound" | jq -r '._source_config')" 'main VLESS-Reality entrance source marker'
+
+shared_select_config="${TEST_TMP}/relay-shared-select.json"
+cat > "$shared_select_config" <<'EOF'
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "legacy-reality-in-21001",
+      "listen_port": 21001,
+      "users": [{"uuid": "77777777-7777-4777-8777-777777777777"}],
+      "tls": {"reality": {"enabled": "true"}}
+    },
+    {
+      "type": "anytls",
+      "tag": "legacy-anytls-in-21002",
+      "listen_port": 21002,
+      "users": [{"name": "default", "password": "88888888-8888-4888-8888-888888888888"}]
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-in-21003",
+      "listen_port": 21003,
+      "users": [{"password": "not-reusable"}]
+    }
+  ]
+}
+EOF
+MAIN_CONFIG_FILE="${TEST_TMP}/missing-main-config.json"
+RELAY_CONFIG_FILE="$shared_select_config"
+selected_shared_inbound=''
+_relay_select_shared_inbound selected_shared_inbound <<< $'1\n' >/dev/null
+assert_eq 'legacy-reality-in-21001' "$(echo "$selected_shared_inbound" | jq -r '.tag')" 'legacy Reality entrance selection'
+selected_shared_inbound=''
+_relay_select_shared_inbound selected_shared_inbound <<< $'2\n' >/dev/null
+assert_eq 'legacy-anytls-in-21002' "$(echo "$selected_shared_inbound" | jq -r '.tag')" 'legacy AnyTLS entrance selection'
+
+# 完整复用流程使用固定公网 IP，避免测试访问网络。
+# 参数：无。
+# 输出：输出文档保留地址作为分享链接主机。
+_get_public_ip() {
+    printf '%s\n' '192.0.2.10'
+}
+
+# 完整复用流程跳过真实 sing-box 配置检查。
+# 参数：
+#   $1 - 待检查的中转配置路径，本测试不使用。
+# 输出：始终返回成功。
+_relay_check_combined_config() {
+    return 0
+}
+
+# 完整复用流程跳过真实服务管理。
+# 参数：
+#   $1 - 服务动作，本测试不使用。
+# 输出：始终返回成功。
+_manage_service() {
+    return 0
+}
+
+# 完整复用流程跳过测试环境中的 YAML 写入。
+# 参数：
+#   $1 - Clash 节点 JSON，本测试不使用。
+# 输出：始终返回成功。
+_add_node_to_relay_yaml() {
+    return 0
+}
+
+# 完整复用流程跳过操作日志写入。
+# 参数：
+#   $1 - 操作类型，本测试不使用。
+#   $2 - 操作详情，本测试不使用。
+# 输出：始终返回成功。
+_log_operation() {
+    return 0
+}
+
+MAIN_CONFIG_FILE="$external_main_config"
+RELAY_CONFIG_FILE="$external_relay_config"
+MAIN_METADATA_FILE="${TEST_TMP}/main-vless-metadata.json"
+RELAY_AUX_DIR="$TEST_TMP"
+printf '%s\n' '{"vless-reality-in-22001":{"publicKey":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","shortId":"0123456789abcdef"}}' > "$MAIN_METADATA_FILE"
+printf '%s\n' '{}' > "${RELAY_AUX_DIR}/relay_links.json"
+for shared_uuid in \
+    'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' \
+    'cccccccc-cccc-4ccc-8ccc-cccccccccccc' \
+    'dddddddd-dddd-4ddd-8ddd-dddddddddddd'; do
+    shared_outbound=$(jq -n '{type:"shadowsocks",tag:"TEMP_TAG",server:"198.51.100.20",server_port:8388,method:"2022-blake3-aes-128-gcm",password:"test-key"}')
+    _relay_add_shared_auth_route 'shadowsocks' '198.51.100.20' '8388' "$shared_outbound" \
+        <<< $'1\n'"${shared_uuid}"$'\n\n\n' >/dev/null
+done
+jq -e '.inbounds[0].users | length == 4' "$MAIN_CONFIG_FILE" >/dev/null || fail 'main VLESS entrance does not support one direct UUID and three shared UUIDs'
+jq -e '
+    ([.route.rules[] | select(.outbound == "direct")] | length) == 1 and
+    ([.route.rules[] | select((.outbound // "") | startswith("relay-out-22001"))] | length) == 3 and
+    (.outbounds | length) == 3
+' "$RELAY_CONFIG_FILE" >/dev/null || fail 'three main VLESS UUIDs did not receive three independent relay routes'
+jq -e '
+    [to_entries[] | select(.value.source_config == "main" and .value.base_route_owned == true)] | length == 3
+' "${RELAY_AUX_DIR}/relay_links.json" >/dev/null || fail 'main VLESS route metadata does not preserve its source and cleanup ownership'
 
 printf 'credential helper tests: OK\n'
