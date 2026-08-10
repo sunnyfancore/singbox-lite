@@ -38,6 +38,153 @@ if ! declare -f _info >/dev/null; then
     _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 fi
 
+# 生成中转入口凭据。
+# 参数：
+#   $1 - 接收生成结果的变量名。
+#   $2 - 生成器类型，支持 uuid 和 rand-hex:长度。
+# 输出：将生成的凭据写入第一个参数指定的变量。
+_relay_generate_credential() {
+    local output_var="$1"
+    local generator="$2"
+    local length=""
+    local generated_value=""
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || {
+        _error "无效的凭据接收变量名: ${output_var}"
+        return 1
+    }
+
+    case "$generator" in
+        uuid)
+            generated_value=$("$SINGBOX_BIN" generate uuid 2>/dev/null) || return 1
+            ;;
+        rand-hex:*)
+            length="${generator#rand-hex:}"
+            [[ "$length" =~ ^[1-9][0-9]*$ ]] || return 1
+            generated_value=$("$SINGBOX_BIN" generate rand --hex "$length" 2>/dev/null) || return 1
+            ;;
+        *)
+            _error "未知的中转凭据生成类型: ${generator}"
+            return 1
+            ;;
+    esac
+
+    [ -n "$generated_value" ] || {
+        _error "中转入口凭据生成失败，请检查 sing-box 核心。"
+        return 1
+    }
+    printf -v "$output_var" '%s' "$generated_value"
+}
+
+# 校验中转入口凭据格式。
+# 参数：
+#   $1 - 校验器类型，支持 nonempty、uuid、reality-key 和 short-id。
+#   $2 - 需要校验的凭据值。
+# 输出：格式有效时返回 0，否则返回 1。
+_relay_validate_credential() {
+    local validator="$1"
+    local value="$2"
+
+    case "$validator" in
+        nonempty)
+            [ -n "$value" ] || { _error "凭据不能为空。"; return 1; }
+            ;;
+        uuid)
+            [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+                _error "UUID 格式错误，应为标准的 8-4-4-4-12 格式。"
+                return 1
+            }
+            ;;
+        reality-key)
+            [[ "$value" =~ ^[A-Za-z0-9_-]{43}$ ]] || {
+                _error "Reality 密钥格式错误，应为 43 位 Base64URL 字符串。"
+                return 1
+            }
+            ;;
+        short-id)
+            [[ "$value" =~ ^([0-9a-fA-F]{2}){1,8}$ ]] || {
+                _error "Reality short_id 应为 2-16 位偶数长度十六进制字符串。"
+                return 1
+            }
+            ;;
+        *)
+            _error "未知的中转凭据校验类型: ${validator}"
+            return 1
+            ;;
+    esac
+}
+
+# 读取或生成中转入口凭据，输入方式与 SNI 一致并直接回显。
+# 参数：
+#   $1 - 接收凭据的变量名。
+#   $2 - 输入提示文本。
+#   $3 - 自动生成器类型。
+#   $4 - 凭据校验器类型。
+#   $5 - 可选的预设凭据；为空时交互读取，直接回车则随机生成。
+# 输出：将校验通过的凭据写入第一个参数指定的变量。
+_relay_resolve_credential() {
+    local output_var="$1"
+    local prompt="$2"
+    local generator="$3"
+    local validator="$4"
+    local value="${5:-}"
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || {
+        _error "无效的凭据接收变量名: ${output_var}"
+        return 1
+    }
+
+    if [ -z "$value" ]; then
+        read -r -p "${prompt} (回车随机生成): " value || return 1
+    fi
+    [ -n "$value" ] || _relay_generate_credential value "$generator" || return 1
+    _relay_validate_credential "$validator" "$value" || return 1
+    printf -v "$output_var" '%s' "$value"
+}
+
+# 读取或生成中转入口的 Reality 密钥对和 short ID。
+# 参数：
+#   $1 - 接收 private key 的变量名。
+#   $2 - 接收 public key 的变量名。
+#   $3 - 接收 short ID 的变量名。
+# 输出：将校验通过的 Reality 凭据写入三个指定变量。
+_relay_resolve_reality_credentials() {
+    local private_output_var="$1"
+    local public_output_var="$2"
+    local short_id_output_var="$3"
+    local resolved_private_key=""
+    local resolved_public_key=""
+    local resolved_short_id=""
+    local generated_keypair=""
+
+    read -r -p "  请输入 Reality private_key (与 public_key 同时留空则随机生成): " resolved_private_key || return 1
+    read -r -p "  请输入 Reality public_key (与 private_key 同时留空则随机生成): " resolved_public_key || return 1
+    read -r -p "  请输入 Reality short_id (回车随机生成): " resolved_short_id || return 1
+
+    if [ -z "$resolved_private_key" ] && [ -z "$resolved_public_key" ]; then
+        generated_keypair=$("$SINGBOX_BIN" generate reality-keypair 2>/dev/null) || {
+            _error "Reality 密钥对生成失败。"
+            return 1
+        }
+        resolved_private_key=$(printf '%s\n' "$generated_keypair" | awk '/PrivateKey/ {print $2; exit}')
+        resolved_public_key=$(printf '%s\n' "$generated_keypair" | awk '/PublicKey/ {print $2; exit}')
+    elif [ -z "$resolved_private_key" ] || [ -z "$resolved_public_key" ]; then
+        _error "Reality private_key 和 public_key 必须同时输入或同时留空。"
+        return 1
+    else
+        _warn "脚本只能校验 Reality 密钥格式，请确认 public_key 确实由该 private_key 生成。"
+    fi
+
+    [ -n "$resolved_short_id" ] || _relay_generate_credential resolved_short_id "rand-hex:8" || return 1
+    _relay_validate_credential reality-key "$resolved_private_key" || return 1
+    _relay_validate_credential reality-key "$resolved_public_key" || return 1
+    _relay_validate_credential short-id "$resolved_short_id" || return 1
+
+    printf -v "$private_output_var" '%s' "$resolved_private_key"
+    printf -v "$public_output_var" '%s' "$resolved_public_key"
+    printf -v "$short_id_output_var" '%s' "$resolved_short_id"
+}
+
 # --- 全局变量 ---
 # 工具路径
 YQ_BINARY="/usr/local/bin/yq"
@@ -911,11 +1058,12 @@ _finalize_relay_setup() {
     local link_ip="$relay_server_ip"; [[ "$relay_server_ip" == *":"* ]] && link_ip="[$relay_server_ip]"
     
     if [ "$relay_type" == "vless-reality" ]; then
-        local uuid=$($SINGBOX_BIN generate uuid)
-        keypair=$($SINGBOX_BIN generate reality-keypair)
-        local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-        pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-        local sid=$($SINGBOX_BIN generate rand --hex 8)
+        local uuid=""
+        local pk=""
+        local sid=""
+        _relay_resolve_credential uuid "  请输入 VLESS UUID" uuid uuid || return 1
+        _relay_resolve_reality_credentials pk pbk sid || return 1
+        keypair=$(printf 'PrivateKey: %s\nPublicKey: %s\n' "$pk" "$pbk")
         
         # 默认开启 XTLS-Vision 流控
         local flow="xtls-rprx-vision"
@@ -926,7 +1074,8 @@ _finalize_relay_setup() {
         link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "hysteria2" ]; then
-        local password=$($SINGBOX_BIN generate rand --hex 16)
+        local password=""
+        _relay_resolve_credential password "  请输入 Hysteria2 密码" "rand-hex:16" nonempty || return 1
         
         local hop_str=""
         local port_range=""
@@ -987,15 +1136,18 @@ _finalize_relay_setup() {
         link="hysteria2://${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000${hop_str}${pin_param}#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "tuic" ]; then
-        local uuid=$($SINGBOX_BIN generate uuid)
-        local password=$($SINGBOX_BIN generate rand --hex 16)
+        local uuid=""
+        local password=""
+        _relay_resolve_credential uuid "  请输入 TUIC UUID" uuid uuid || return 1
+        _relay_resolve_credential password "  请输入 TUIC 密码" "rand-hex:16" nonempty || return 1
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
             
         link="tuic://${uuid}:${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "anytls" ]; then
-        local password=$($SINGBOX_BIN generate uuid)
+        local password=""
+        _relay_resolve_credential password "  请输入 AnyTLS 密码/UUID" uuid nonempty || return 1
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
             
@@ -2704,12 +2856,14 @@ _menu() {
         esac
     done
 }
-# 命令行参数解析：支持 cron 定时任务直接调用刷新函数
-case "${1:-}" in
-    pf-dns-refresh)
-        _pf_dns_refresh
-        exit 0
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # 命令行参数解析：支持 cron 定时任务直接调用刷新函数。
+    case "${1:-}" in
+        pf-dns-refresh)
+            _pf_dns_refresh
+            exit 0
+            ;;
+    esac
 
-_menu
+    _menu
+fi

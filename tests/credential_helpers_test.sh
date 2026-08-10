@@ -148,4 +148,44 @@ for choice in {1..11}; do
     fi
 done
 
+INIT_SYSTEM=direct
+# shellcheck source=../advanced_relay.sh
+source "${REPO_ROOT}/advanced_relay.sh"
+SINGBOX_BIN="${TEST_TMP}/sing-box"
+
+relay_generated_uuid=''
+_relay_generate_credential relay_generated_uuid uuid
+assert_eq '123e4567-e89b-12d3-a456-426614174000' "$relay_generated_uuid" 'relay UUID generation'
+
+relay_custom_password=''
+_relay_resolve_credential relay_custom_password '中转密码' 'rand-hex:16' nonempty 'custom-relay-password'
+assert_eq 'custom-relay-password' "$relay_custom_password" 'custom relay password preservation'
+
+if _relay_resolve_credential relay_generated_uuid '中转 UUID' uuid uuid invalid >/dev/null 2>&1; then
+    fail 'invalid relay UUID was accepted'
+fi
+
+relay_private_key=''
+relay_public_key=''
+relay_short_id=''
+_relay_resolve_reality_credentials relay_private_key relay_public_key relay_short_id <<< $'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\nDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\n0123456789abcdef'
+assert_eq 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC' "$relay_private_key" 'custom relay Reality private key'
+assert_eq 'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD' "$relay_public_key" 'custom relay Reality public key'
+assert_eq '0123456789abcdef' "$relay_short_id" 'custom relay Reality short ID'
+
+_relay_resolve_reality_credentials relay_private_key relay_public_key relay_short_id <<< $'\n\n\n'
+assert_eq 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' "$relay_private_key" 'generated relay Reality private key'
+assert_eq 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' "$relay_public_key" 'generated relay Reality public key'
+assert_eq 'aaaaaaaaaaaaaaaa' "$relay_short_id" 'generated relay Reality short ID'
+
+if _relay_resolve_reality_credentials relay_private_key relay_public_key relay_short_id <<< $'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n\n0123456789abcdef' >/dev/null 2>&1; then
+    fail 'incomplete relay Reality key pair was accepted'
+fi
+
+relay_setup_function=$(declare -f _finalize_relay_setup)
+[[ "$relay_setup_function" == *'_relay_resolve_credential uuid "  请输入 VLESS UUID"'* ]] || fail 'VLESS relay credentials are not configurable'
+[[ "$relay_setup_function" == *'_relay_resolve_credential password "  请输入 Hysteria2 密码"'* ]] || fail 'Hysteria2 relay credentials are not configurable'
+[[ "$relay_setup_function" == *'_relay_resolve_credential password "  请输入 TUIC 密码"'* ]] || fail 'TUIC relay credentials are not configurable'
+[[ "$relay_setup_function" == *'_relay_resolve_credential password "  请输入 AnyTLS 密码/UUID"'* ]] || fail 'AnyTLS relay credentials are not configurable'
+
 printf 'credential helper tests: OK\n'
