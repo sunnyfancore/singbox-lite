@@ -84,7 +84,15 @@ update_function=$(declare -f _update_script)
 [[ "$update_function" == *'mkdir -p "$target_parent"'* ]] || fail 'missing sub-script install locations are not created during updates'
 [[ "$update_function" == *'cmp -s "$temp_sub_path" "$script_path"'* ]] || fail 'updated sub-script copies are not verified'
 [[ "$update_function" == *'if [ "$component_update_failed" = true ]'* ]] || fail 'partial sub-script update failures are still reported as full success'
-assert_eq '23' "$SCRIPT_VERSION" 'main script version after updater repair'
+assert_eq '25' "$SCRIPT_VERSION" 'main script version after AnyTLS padding repair'
+
+normalized_menu_choice=''
+_normalize_numeric_menu_choice normalized_menu_choice $' \t15\r '
+assert_eq '15' "$normalized_menu_choice" 'menu choice CR and whitespace normalization'
+_normalize_numeric_menu_choice normalized_menu_choice $'\e[200~15\e[201~'
+assert_eq '15' "$normalized_menu_choice" 'menu choice bracketed-paste normalization'
+main_menu_function=$(declare -f _main_menu)
+[[ "$main_menu_function" == *'_normalize_numeric_menu_choice choice "$choice"'* ]] || fail 'main menu does not normalize terminal input before dispatch'
 
 update_test_root="${TEST_TMP}/script-update"
 update_script_dir="${update_test_root}/bin"
@@ -259,7 +267,8 @@ relay_setup_function=$(declare -f _finalize_relay_setup)
 [[ "$relay_setup_function" == *'"name":$u,"uuid":$u'* ]] || fail 'VLESS-Reality relay name does not match UUID'
 [[ "$relay_setup_function" == *'"name":$pw,"password":$pw'* ]] || fail 'AnyTLS relay name does not match its UUID credential'
 [[ "$relay_setup_function" == *'_relay_resolve_anytls_padding_scheme padding_scheme_json'* ]] || fail 'AnyTLS relay padding scheme is not configurable'
-[[ "$relay_setup_function" == *'if $padding != null then .padding_scheme = $padding else . end'* ]] || fail 'AnyTLS relay does not omit padding_scheme for the core default'
+[[ "$relay_setup_function" == *'.padding_scheme = $padding'* ]] || fail 'AnyTLS relay does not always write padding_scheme'
+[[ "$relay_setup_function" != *'"padding_scheme":[]'* ]] || fail 'Any-Reality relay still hardcodes an empty padding scheme'
 [[ "$relay_setup_function" == *'"auth_user":[$au]'* ]] || fail 'new relay routes do not match auth_user'
 [[ "$relay_setup_function" == *'relay_type="any-reality"'* ]] || fail 'Any-Reality relay entrance is missing'
 [[ "$relay_setup_function" == *'复用入口未完成，按回车重新选择入口协议'* ]] || fail 'failed entrance reuse still exits directly to the menu'
@@ -295,9 +304,14 @@ main_reality_function=$(declare -f _add_vless_reality)
 main_anytls_function=$(declare -f _create_anytls_tls_node)
 [[ "$main_anytls_function" == *'"name": $pw, "password": $pw'* ]] || fail 'main AnyTLS name does not match its UUID credential'
 [[ "$main_anytls_function" == *'_resolve_anytls_padding_scheme padding_scheme_json'* ]] || fail 'main AnyTLS padding scheme is not configurable'
-[[ "$main_anytls_function" == *'if $padding != null then .padding_scheme = $padding else . end'* ]] || fail 'main AnyTLS does not omit padding_scheme for the core default'
+[[ "$main_anytls_function" == *'.padding_scheme = $padding'* ]] || fail 'main AnyTLS does not always write padding_scheme'
 main_anyreality_function=$(declare -f _create_anyreality_node)
 [[ "$main_anyreality_function" == *'"name": $pw, "password": $pw'* ]] || fail 'main Any-Reality name does not match its UUID credential'
+[[ "$main_anyreality_function" == *'_resolve_anytls_padding_scheme padding_scheme_json'* ]] || fail 'main Any-Reality padding scheme is not configurable'
+[[ "$main_anyreality_function" == *'"padding_scheme": $padding'* ]] || fail 'main Any-Reality does not write padding_scheme'
+main_anytls_menu_function=$(declare -f _add_anytls)
+[[ "$main_anytls_menu_function" == *'tls_padding_scheme_json'* && "$main_anytls_menu_function" == *'reality_padding_scheme_json'* ]] || fail 'combined AnyTLS creation does not keep independent padding schemes'
+[[ "$main_anytls_menu_function" == *'请设置 Any-Reality 入站的 padding_scheme'* ]] || fail 'combined AnyTLS creation does not identify the Any-Reality padding prompt'
 
 unset -f jq
 command -v jq >/dev/null 2>&1 || fail 'jq is required for auth routing configuration tests'
@@ -307,15 +321,23 @@ resolved_padding=''
 _resolve_anytls_padding_scheme resolved_padding "$custom_padding"
 assert_eq "$custom_padding" "$resolved_padding" 'main AnyTLS padding JSON preset'
 unset BATCH_ANYTLS_PADDING_SCHEME
-core_default_padding=''
-_resolve_anytls_padding_scheme core_default_padding
-assert_eq 'null' "$core_default_padding" 'main AnyTLS core default padding marker'
+random_main_padding=''
+_resolve_anytls_padding_scheme random_main_padding
+printf '%s' "$random_main_padding" | jq -e '
+    type == "array" and length >= 6 and length <= 9 and
+    (.[0] | test("^stop=[5-8]$")) and
+    (.[1:] | all(.[]; test("^[0-9]+=[0-9]+-[0-9]+$")))
+' >/dev/null || fail 'main AnyTLS blank input does not generate a runtime padding scheme'
 relay_padding=''
 _relay_resolve_anytls_padding_scheme relay_padding "$custom_padding"
 assert_eq "$custom_padding" "$relay_padding" 'relay AnyTLS padding JSON preset'
-relay_default_padding=''
-_relay_resolve_anytls_padding_scheme relay_default_padding <<< $'\n'
-assert_eq 'null' "$relay_default_padding" 'relay AnyTLS core default padding marker'
+random_relay_padding=''
+_relay_resolve_anytls_padding_scheme random_relay_padding <<< $'\n'
+printf '%s' "$random_relay_padding" | jq -e '
+    type == "array" and length >= 6 and length <= 9 and
+    (.[0] | test("^stop=[5-8]$")) and
+    (.[1:] | all(.[]; test("^[0-9]+=[0-9]+-[0-9]+$")))
+' >/dev/null || fail 'relay AnyTLS blank input does not generate a runtime padding scheme'
 interactive_padding=''
 _relay_resolve_anytls_padding_scheme interactive_padding <<< $'stop=2\n0=10-20\n1=30-40\n\n'
 assert_eq "$custom_padding" "$interactive_padding" 'relay AnyTLS interactive padding input'

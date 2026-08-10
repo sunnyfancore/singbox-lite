@@ -185,11 +185,59 @@ _relay_resolve_reality_credentials() {
     printf -v "$short_id_output_var" '%s' "$resolved_short_id"
 }
 
-# 读取中转 AnyTLS padding_scheme，支持逐行输入或 JSON 数组预设。
+# 生成指定闭区间内的随机整数，供中转 AnyTLS padding_scheme 使用。
+# 参数：
+#   $1 - 接收随机整数的变量名。
+#   $2 - 随机整数最小值。
+#   $3 - 随机整数最大值。
+# 输出：将运行时生成的随机整数写入第一个参数指定的变量。
+_relay_anytls_random_int() {
+    local output_var="$1"
+    local min_value="$2"
+    local max_value="$3"
+    local random_hex=""
+    local random_value=0
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    [[ "$min_value" =~ ^[0-9]+$ && "$max_value" =~ ^[0-9]+$ ]] || return 1
+    [ "$min_value" -le "$max_value" ] || return 1
+    _relay_generate_credential random_hex "rand-hex:4" || return 1
+    random_value=$((16#${random_hex:0:8}))
+    printf -v "$output_var" '%s' "$((min_value + random_value % (max_value - min_value + 1)))"
+}
+
+# 在运行时随机生成中转 AnyTLS padding_scheme，不保存固定方案。
+# 参数：
+#   $1 - 接收 padding_scheme JSON 数组的变量名。
+# 输出：生成 stop 和对应编号的随机范围规则，并写入第一个参数指定的变量。
+_relay_generate_anytls_padding_scheme() {
+    local output_var="$1"
+    local rule_count=0
+    local rule_index=0
+    local range_start=0
+    local range_width=0
+    local range_end=0
+    local rule_line=""
+    local generated_json='[]'
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    _relay_anytls_random_int rule_count 5 8 || return 1
+    generated_json=$(jq -cn --arg line "stop=${rule_count}" '[$line]') || return 1
+    for ((rule_index=0; rule_index<rule_count; rule_index++)); do
+        _relay_anytls_random_int range_start 0 90 || return 1
+        _relay_anytls_random_int range_width 8 100 || return 1
+        range_end=$((range_start + range_width))
+        rule_line="${rule_index}=${range_start}-${range_end}"
+        generated_json=$(printf '%s' "$generated_json" | jq -c --arg line "$rule_line" '. + [$line]') || return 1
+    done
+    printf -v "$output_var" '%s' "$generated_json"
+}
+
+# 读取中转 AnyTLS padding_scheme，支持逐行输入、运行时随机生成或 JSON 数组预设。
 # 参数：
 #   $1 - 接收 padding_scheme JSON 数组的变量名。
 #   $2 - 可选的 JSON 数组预设，主要用于测试或非交互调用。
-# 输出：将校验通过的 JSON 数组写入第一个参数指定的变量；null 表示使用核心默认值。
+# 输出：将手动输入或运行时随机生成的 JSON 数组写入第一个参数指定的变量。
 _relay_resolve_anytls_padding_scheme() {
     local output_var="$1"
     local preset_json="${2:-}"
@@ -206,10 +254,10 @@ _relay_resolve_anytls_padding_scheme() {
         padding_json="$preset_json"
     else
         echo ""
-        _info "请输入 AnyTLS padding_scheme，每行一条；第一行回车使用 sing-box 核心默认值。"
+        _info "请输入 AnyTLS padding_scheme，每行一条；第一行回车随机生成。"
         read -r -p "  第 1 条规则: " padding_line || return 1
         if [ -z "$padding_line" ]; then
-            padding_json="null"
+            padding_json=""
         else
             padding_json=$(jq -n --arg line "$padding_line" '[$line]') || return 1
             line_number=2
@@ -222,8 +270,16 @@ _relay_resolve_anytls_padding_scheme() {
         fi
     fi
 
-    if ! printf '%s' "$padding_json" | jq -e '. == null or (type == "array" and length > 0 and all(.[]; type == "string" and length > 0))' >/dev/null 2>&1; then
-        _error "AnyTLS padding_scheme 必须是 null 或至少包含一条非空字符串的 JSON 数组。"
+    if [ -z "$padding_json" ] || [ "$padding_json" == "null" ]; then
+        _relay_generate_anytls_padding_scheme padding_json || {
+            _error "随机生成中转 AnyTLS padding_scheme 失败。"
+            return 1
+        }
+        _info "已随机生成 AnyTLS padding_scheme："
+        printf '%s' "$padding_json" | jq -r '.[] | "    " + .' >&2
+    fi
+    if ! printf '%s' "$padding_json" | jq -e 'type == "array" and length > 1 and all(.[]; type == "string" and length > 0)' >/dev/null 2>&1; then
+        _error "AnyTLS padding_scheme 必须是至少包含两条非空字符串的 JSON 数组。"
         return 1
     fi
     printf -v "$output_var" '%s' "$(printf '%s' "$padding_json" | jq -c '.')"
@@ -1984,7 +2040,7 @@ _finalize_relay_setup() {
         _relay_generate_certificate "$entrance_sni" "$cert_path" "$key_path" || return 1
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" --argjson padding "$padding_scheme_json" \
             '({"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":$pw,"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}
-            | if $padding != null then .padding_scheme = $padding else . end)')
+            | .padding_scheme = $padding)')
             
         local cert_pcs=$(_cert_sha256_hex "$cert_path")
         local pin_param=""
@@ -1994,7 +2050,9 @@ _finalize_relay_setup() {
         local password=""
         local pk=""
         local sid=""
+        local padding_scheme_json=""
         _relay_resolve_credential password "  请输入 Any-Reality 密码/UUID" uuid nonempty || return 1
+        _relay_resolve_anytls_padding_scheme padding_scheme_json || return 1
         _relay_resolve_reality_credentials pk pbk sid || return 1
         auth_user="$password"
         encoded_password=$(_url_encode "$password") || {
@@ -2002,8 +2060,8 @@ _finalize_relay_setup() {
             return 1
         }
         keypair=$(printf 'PrivateKey: %s\nPublicKey: %s\n' "$pk" "$pbk")
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" \
-            '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":$pw,"password":$pw}],"padding_scheme":[],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" --argjson padding "$padding_scheme_json" \
+            '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":$pw,"password":$pw}],"padding_scheme":$padding,"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
         link="anytls://${encoded_password}@${link_ip}:${listen_port}?security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#$(_url_encode "${node_name}")"
     fi
 
@@ -3848,7 +3906,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v18)                  ║"
+        echo "  ║                (v19)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 

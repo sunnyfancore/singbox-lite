@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="23"
+export SCRIPT_VERSION="25"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -3294,11 +3294,59 @@ _add_trojan_ws_tls() {
     _show_node_link "trojan-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$password" "$camouflage_domain" "$ws_path" "$skip_verify" "$cert_path"
 }
 
-# 读取 AnyTLS padding_scheme，支持交互逐行输入和批量 JSON 预设。
+# 生成指定闭区间内的随机整数，供 AnyTLS padding_scheme 使用。
+# 参数：
+#   $1 - 接收随机整数的变量名。
+#   $2 - 随机整数最小值。
+#   $3 - 随机整数最大值。
+# 输出：将运行时生成的随机整数写入第一个参数指定的变量。
+_anytls_random_int() {
+    local output_var="$1"
+    local min_value="$2"
+    local max_value="$3"
+    local random_hex=""
+    local random_value=0
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    [[ "$min_value" =~ ^[0-9]+$ && "$max_value" =~ ^[0-9]+$ ]] || return 1
+    [ "$min_value" -le "$max_value" ] || return 1
+    random_hex=$(_generate_credential "rand-hex:4") || return 1
+    random_value=$((16#${random_hex:0:8}))
+    printf -v "$output_var" '%s' "$((min_value + random_value % (max_value - min_value + 1)))"
+}
+
+# 在运行时随机生成 AnyTLS padding_scheme，不在脚本中保存固定方案。
+# 参数：
+#   $1 - 接收 padding_scheme JSON 数组的变量名。
+# 输出：生成 stop 和对应编号的随机范围规则，并写入第一个参数指定的变量。
+_generate_anytls_padding_scheme() {
+    local output_var="$1"
+    local rule_count=0
+    local rule_index=0
+    local range_start=0
+    local range_width=0
+    local range_end=0
+    local rule_line=""
+    local generated_json='[]'
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    _anytls_random_int rule_count 5 8 || return 1
+    generated_json=$(jq -cn --arg line "stop=${rule_count}" '[$line]') || return 1
+    for ((rule_index=0; rule_index<rule_count; rule_index++)); do
+        _anytls_random_int range_start 0 90 || return 1
+        _anytls_random_int range_width 8 100 || return 1
+        range_end=$((range_start + range_width))
+        rule_line="${rule_index}=${range_start}-${range_end}"
+        generated_json=$(printf '%s' "$generated_json" | jq -c --arg line "$rule_line" '. + [$line]') || return 1
+    done
+    printf -v "$output_var" '%s' "$generated_json"
+}
+
+# 读取 AnyTLS padding_scheme，支持交互逐行输入、运行时随机生成和批量 JSON 预设。
 # 参数：
 #   $1 - 接收 padding_scheme JSON 数组的变量名。
 #   $2 - 可选的 JSON 数组预设；批量模式为空时读取 BATCH_ANYTLS_PADDING_SCHEME。
-# 输出：将校验通过的 JSON 数组写入第一个参数指定的变量；null 表示使用核心默认值。
+# 输出：将手动输入或运行时随机生成的 JSON 数组写入第一个参数指定的变量。
 _resolve_anytls_padding_scheme() {
     local output_var="$1"
     local preset_json="${2:-}"
@@ -3314,13 +3362,13 @@ _resolve_anytls_padding_scheme() {
     if [ -n "$preset_json" ]; then
         padding_json="$preset_json"
     elif [ "${BATCH_MODE:-false}" == "true" ]; then
-        padding_json="${BATCH_ANYTLS_PADDING_SCHEME:-null}"
+        padding_json="${BATCH_ANYTLS_PADDING_SCHEME:-}"
     else
         echo ""
-        _info "请输入 AnyTLS padding_scheme，每行一条；第一行回车使用 sing-box 核心默认值。"
+        _info "请输入 AnyTLS padding_scheme，每行一条；第一行回车随机生成。"
         read -r -p "  第 1 条规则: " padding_line || return 1
         if [ -z "$padding_line" ]; then
-            padding_json="null"
+            padding_json=""
         else
             padding_json=$(jq -n --arg line "$padding_line" '[$line]') || return 1
             line_number=2
@@ -3333,8 +3381,16 @@ _resolve_anytls_padding_scheme() {
         fi
     fi
 
-    if ! printf '%s' "$padding_json" | jq -e '. == null or (type == "array" and length > 0 and all(.[]; type == "string" and length > 0))' >/dev/null 2>&1; then
-        _error "AnyTLS padding_scheme 必须是 null 或至少包含一条非空字符串的 JSON 数组。"
+    if [ -z "$padding_json" ] || [ "$padding_json" == "null" ]; then
+        _generate_anytls_padding_scheme padding_json || {
+            _error "随机生成 AnyTLS padding_scheme 失败。"
+            return 1
+        }
+        _info "已随机生成 AnyTLS padding_scheme："
+        printf '%s' "$padding_json" | jq -r '.[] | "    " + .' >&2
+    fi
+    if ! printf '%s' "$padding_json" | jq -e 'type == "array" and length > 1 and all(.[]; type == "string" and length > 0)' >/dev/null 2>&1; then
+        _error "AnyTLS padding_scheme 必须是至少包含两条非空字符串的 JSON 数组。"
         return 1
     fi
     printf -v "$output_var" '%s' "$(printf '%s' "$padding_json" | jq -c '.')"
@@ -3347,6 +3403,7 @@ _resolve_anytls_padding_scheme() {
 #   $3 - TLS 服务器名称。
 #   $4 - AnyTLS 密码/UUID，同时作为认证用户名。
 #   $5 - 节点显示名称。
+#   $6 - 可选的 padding_scheme JSON 数组；为空时在函数内解析。
 # 输出：写入服务端、YAML 和元数据配置，并显示分享链接。
 _create_anytls_tls_node() {
     local node_ip="$1"
@@ -3354,9 +3411,9 @@ _create_anytls_tls_node() {
     local server_name="$3"
     local password="$4"
     local name="$5"
-    local padding_scheme_json=""
+    local padding_scheme_json="${6:-}"
 
-    _resolve_anytls_padding_scheme padding_scheme_json || return 1
+    [ -n "$padding_scheme_json" ] || _resolve_anytls_padding_scheme padding_scheme_json || return 1
 
     # --- 步骤 4: 证书选择 ---
     local cert_choice="1"
@@ -3429,7 +3486,7 @@ _create_anytls_tls_node() {
                 "key_path": $kp
             }
         }
-        | if $padding != null then .padding_scheme = $padding else . end')
+        | .padding_scheme = $padding')
     
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
     
@@ -3486,6 +3543,7 @@ _create_anytls_tls_node() {
 #   $6 - Reality private key。
 #   $7 - Reality public key。
 #   $8 - Reality short ID。
+#   $9 - 可选的 padding_scheme JSON 数组；为空时在函数内解析。
 # 输出：写入服务端和元数据配置，并显示 Any-Reality 分享链接。
 _create_anyreality_node() {
     local node_ip="$1"
@@ -3496,7 +3554,10 @@ _create_anyreality_node() {
     local private_key="$6"
     local public_key="$7"
     local short_id="$8"
+    local padding_scheme_json="${9:-}"
     local tag="any-reality-in-${port}"
+
+    [ -n "$padding_scheme_json" ] || _resolve_anytls_padding_scheme padding_scheme_json || return 1
 
     if [ -z "$private_key" ] && [ -z "$public_key" ] && [ -z "$short_id" ]; then
         _resolve_reality_credentials || return 1
@@ -3515,13 +3576,14 @@ _create_anyreality_node() {
         --arg sn "$server_name" \
         --arg pk "$private_key" \
         --arg sid "$short_id" \
+        --argjson padding "$padding_scheme_json" \
         '{
             "type": "anytls",
             "tag": $t,
             "listen": "::",
             "listen_port": ($p|tonumber),
             "users": [{"name": $pw, "password": $pw}],
-            "padding_scheme": [],
+            "padding_scheme": $padding,
             "tls": {
                 "enabled": true,
                 "server_name": $sn,
@@ -3606,6 +3668,22 @@ _add_anytls() {
 
     local password=""
     _resolve_credential password "请输入 AnyTLS 密码/UUID" uuid nonempty || return 1
+    local tls_padding_scheme_json=""
+    local reality_padding_scheme_json=""
+    case "$mode_choice" in
+        1)
+            _resolve_anytls_padding_scheme tls_padding_scheme_json || return 1
+            ;;
+        2)
+            _resolve_anytls_padding_scheme reality_padding_scheme_json || return 1
+            ;;
+        1,2|2,1|"1 2"|"2 1")
+            _info "请设置普通 AnyTLS 入站的 padding_scheme。"
+            _resolve_anytls_padding_scheme tls_padding_scheme_json || return 1
+            _info "请设置 Any-Reality 入站的 padding_scheme。"
+            _resolve_anytls_padding_scheme reality_padding_scheme_json || return 1
+            ;;
+    esac
 
     local reality_private_key=""
     local reality_public_key=""
@@ -3628,7 +3706,7 @@ _add_anytls() {
                 read -p "请输入 AnyTLS 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
-            _create_anytls_tls_node "$node_ip" "$port" "$server_name" "$password" "$name" || return 1
+            _create_anytls_tls_node "$node_ip" "$port" "$server_name" "$password" "$name" "$tls_padding_scheme_json" || return 1
             created=true
             ;;
         2)
@@ -3640,7 +3718,7 @@ _add_anytls() {
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
-            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$reality_private_key" "$reality_public_key" "$reality_short_id" || return 1
+            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$reality_private_key" "$reality_public_key" "$reality_short_id" "$reality_padding_scheme_json" || return 1
             created=true
             ;;
         1,2|2,1|"1 2"|"2 1")
@@ -3659,8 +3737,8 @@ _add_anytls() {
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_reality_name}): " custom_reality_name
                 reality_name=${custom_reality_name:-$default_reality_name}
             fi
-            _create_anytls_tls_node "$node_ip" "$tls_port" "$server_name" "$password" "$tls_name" || return 1
-            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" "$reality_private_key" "$reality_public_key" "$reality_short_id" || return 1
+            _create_anytls_tls_node "$node_ip" "$tls_port" "$server_name" "$password" "$tls_name" "$tls_padding_scheme_json" || return 1
+            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" "$reality_private_key" "$reality_public_key" "$reality_short_id" "$reality_padding_scheme_json" || return 1
             created=true
             ;;
     esac
@@ -5622,6 +5700,28 @@ _xray_features() {
     fi
 }
 
+# 规范化数字菜单输入，兼容 CR 和终端 bracketed-paste 控制序列。
+# 参数：
+#   $1 - 接收规范化结果的变量名。
+#   $2 - read 读取到的原始菜单输入。
+# 输出：将清理后的输入写入第一个参数指定的变量。
+_normalize_numeric_menu_choice() {
+    local output_var="$1"
+    local raw_choice="$2"
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    raw_choice=${raw_choice//$'\e[200~'/}
+    raw_choice=${raw_choice//$'\e[201~'/}
+    raw_choice=${raw_choice//$'\r'/}
+    while [[ "$raw_choice" == [[:space:]]* ]]; do
+        raw_choice="${raw_choice#?}"
+    done
+    while [[ "$raw_choice" == *[[:space:]] ]]; do
+        raw_choice="${raw_choice%?}"
+    done
+    printf -v "$output_var" '%s' "$raw_choice"
+}
+
 _main_menu() {
     while true; do
         clear
@@ -5778,7 +5878,8 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-19]: " choice
+        IFS= read -r -p "  请输入选项 [0-19]: " choice
+        _normalize_numeric_menu_choice choice "$choice"
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
