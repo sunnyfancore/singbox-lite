@@ -77,6 +77,26 @@ reality_function=$(declare -f _resolve_reality_credentials)
 [[ "$reality_function" != *'read -r -s'* ]] || fail 'Reality private key input is still hidden'
 [[ "$credential_function" == *'read -r -p'* ]] || fail 'credential input does not use a normal visible prompt'
 
+update_function=$(declare -f _update_script)
+[[ "$update_function" == *'paths_to_check+=("$active_script_path")'* ]] || fail 'sub-script update order does not match launch order'
+[[ "$update_function" == *'for script_path in "${installed_paths[@]}"'* ]] || fail 'all installed sub-script copies are not updated'
+[[ "$update_function" == *'! bash -n "$temp_sub_path"'* ]] || fail 'downloaded sub-scripts are not syntax checked'
+
+uninstall_function=$(declare -f _uninstall)
+[[ "$uninstall_function" == *'/etc/systemd/system/sing-box.service'* ]] || fail 'uninstall misses the sing-box systemd service'
+[[ "$uninstall_function" == *'/etc/systemd/system/sing-box-relay.service'* ]] || fail 'uninstall misses the relay systemd service'
+[[ "$uninstall_function" == *'/etc/systemd/system/sing-box-restart.timer'* ]] || fail 'uninstall misses the restart timer'
+[[ "$uninstall_function" == *'rm -rf "${SINGBOX_DIR}" /etc/cloudflared'* ]] || fail 'uninstall misses sing-box or cloudflared configuration'
+[[ "$uninstall_function" == *'rm -rf /usr/local/etc/xray'* ]] || fail 'uninstall misses Xray configuration'
+
+delete_node_function=$(declare -f _delete_node)
+[[ "$delete_node_function" != *'${SINGBOX_DIR}/*.pem'* ]] || fail 'main node deletion still removes all shared certificates'
+[[ "$delete_node_function" == *'for owned_tag in "${inbound_tags[@]}"'* ]] || fail 'main node deletion does not scope certificates by tag'
+
+if grep -Fq '${password}@' "${REPO_ROOT}/singbox.sh" || grep -Fq '${pw}@' "${REPO_ROOT}/singbox.sh"; then
+    fail 'a main-script share link still embeds an unencoded password'
+fi
+
 key16=$(_generate_credential 'rand-base64:16')
 key32=$(_generate_credential 'rand-base64:32')
 _validate_credential 'base64-bytes:16' "$key16"
@@ -187,5 +207,164 @@ relay_setup_function=$(declare -f _finalize_relay_setup)
 [[ "$relay_setup_function" == *'_relay_resolve_credential password "  请输入 Hysteria2 密码"'* ]] || fail 'Hysteria2 relay credentials are not configurable'
 [[ "$relay_setup_function" == *'_relay_resolve_credential password "  请输入 TUIC 密码"'* ]] || fail 'TUIC relay credentials are not configurable'
 [[ "$relay_setup_function" == *'_relay_resolve_credential password "  请输入 AnyTLS 密码/UUID"'* ]] || fail 'AnyTLS relay credentials are not configurable'
+[[ "$relay_setup_function" == *'hysteria2://${encoded_password}@'* ]] || fail 'Hysteria2 relay password is not URL encoded'
+[[ "$relay_setup_function" == *'tuic://${uuid}:${encoded_password}@'* ]] || fail 'TUIC relay password is not URL encoded'
+[[ "$relay_setup_function" == *'anytls://${encoded_password}@'* ]] || fail 'AnyTLS relay password is not URL encoded'
+[[ "$relay_setup_function" == *'"$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$CONFIG_FILE"'* ]] || fail 'relay setup does not validate the combined sing-box configuration'
+[[ "$relay_setup_function" == *'if ! _manage_service restart'* ]] || fail 'relay setup does not check service restart failures'
+[[ "$relay_setup_function" == *'_relay_rollback_setup "$CONFIG_FILE"'* ]] || fail 'relay setup does not roll back a failed restart'
+[[ "$relay_setup_function" == *'"name":$u,"uuid":$u'* ]] || fail 'VLESS-Reality relay name does not match UUID'
+[[ "$relay_setup_function" == *'"name":$pw,"password":$pw'* ]] || fail 'AnyTLS relay name does not match its UUID credential'
+[[ "$relay_setup_function" == *'_relay_resolve_anytls_padding_scheme padding_scheme_json'* ]] || fail 'AnyTLS relay padding scheme is not configurable'
+[[ "$relay_setup_function" == *'if $padding != null then .padding_scheme = $padding else . end'* ]] || fail 'AnyTLS relay does not omit padding_scheme for the core default'
+[[ "$relay_setup_function" == *'"auth_user":[$au]'* ]] || fail 'new relay routes do not match auth_user'
+[[ "$relay_setup_function" == *'relay_type="any-reality"'* ]] || fail 'Any-Reality relay entrance is missing'
+
+shared_route_function=$(declare -f _relay_add_shared_auth_route)
+[[ "$shared_route_function" == *'_relay_select_shared_inbound selected_inbound'* ]] || fail 'shared auth routing does not select an existing entrance'
+[[ "$shared_route_function" == *'_relay_apply_shared_route_config'* ]] || fail 'shared auth routing does not append a user route'
+[[ "$shared_route_function" == *'_relay_check_combined_config'* ]] || fail 'shared auth routing does not validate the combined configuration'
+
+rollback_config="${TEST_TMP}/relay-rollback.json"
+rollback_backup="${rollback_config}.bak"
+rollback_cert="${TEST_TMP}/relay-rollback.pem"
+rollback_key="${TEST_TMP}/relay-rollback.key"
+printf '%s\n' 'new-config' > "$rollback_config"
+printf '%s\n' 'old-config' > "$rollback_backup"
+printf '%s\n' 'certificate' > "$rollback_cert"
+printf '%s\n' 'private-key' > "$rollback_key"
+_relay_rollback_setup "$rollback_config" "$rollback_backup" "$rollback_cert" "$rollback_key" ''
+assert_eq 'old-config' "$(<"$rollback_config")" 'relay configuration rollback'
+[ ! -e "$rollback_backup" ] || fail 'relay rollback backup was not consumed'
+[ ! -e "$rollback_cert" ] || fail 'relay rollback certificate was not removed'
+[ ! -e "$rollback_key" ] || fail 'relay rollback private key was not removed'
+
+clear_relays_function=$(declare -f _clear_all_relays)
+[[ "$clear_relays_function" != *'*.pem'* ]] || fail 'relay deletion still removes all shared certificates'
+[[ "$clear_relays_function" != *'.proxies = []'* ]] || fail 'relay deletion still clears all shared YAML proxies'
+[[ "$clear_relays_function" == *'_relay_remove_owned_certificates'* ]] || fail 'relay deletion does not scope certificates by tag'
+
+main_reality_function=$(declare -f _add_vless_reality)
+[[ "$main_reality_function" == *'"name":$u,"uuid":$u'* ]] || fail 'main VLESS-Reality name does not match UUID'
+main_anytls_function=$(declare -f _create_anytls_tls_node)
+[[ "$main_anytls_function" == *'"name": $pw, "password": $pw'* ]] || fail 'main AnyTLS name does not match its UUID credential'
+[[ "$main_anytls_function" == *'_resolve_anytls_padding_scheme padding_scheme_json'* ]] || fail 'main AnyTLS padding scheme is not configurable'
+[[ "$main_anytls_function" == *'if $padding != null then .padding_scheme = $padding else . end'* ]] || fail 'main AnyTLS does not omit padding_scheme for the core default'
+main_anyreality_function=$(declare -f _create_anyreality_node)
+[[ "$main_anyreality_function" == *'"name": $pw, "password": $pw'* ]] || fail 'main Any-Reality name does not match its UUID credential'
+
+unset -f jq
+command -v jq >/dev/null 2>&1 || fail 'jq is required for auth routing configuration tests'
+
+custom_padding='["stop=2","0=10-20","1=30-40"]'
+resolved_padding=''
+_resolve_anytls_padding_scheme resolved_padding "$custom_padding"
+assert_eq "$custom_padding" "$resolved_padding" 'main AnyTLS padding JSON preset'
+unset BATCH_ANYTLS_PADDING_SCHEME
+core_default_padding=''
+_resolve_anytls_padding_scheme core_default_padding
+assert_eq 'null' "$core_default_padding" 'main AnyTLS core default padding marker'
+relay_padding=''
+_relay_resolve_anytls_padding_scheme relay_padding "$custom_padding"
+assert_eq "$custom_padding" "$relay_padding" 'relay AnyTLS padding JSON preset'
+relay_default_padding=''
+_relay_resolve_anytls_padding_scheme relay_default_padding <<< $'\n'
+assert_eq 'null' "$relay_default_padding" 'relay AnyTLS core default padding marker'
+interactive_padding=''
+_relay_resolve_anytls_padding_scheme interactive_padding <<< $'stop=2\n0=10-20\n1=30-40\n\n'
+assert_eq "$custom_padding" "$interactive_padding" 'relay AnyTLS interactive padding input'
+if _resolve_anytls_padding_scheme resolved_padding '["",1]' >/dev/null 2>&1; then
+    fail 'invalid AnyTLS padding JSON was accepted'
+fi
+
+old_uuid='11111111-1111-4111-8111-111111111111'
+new_uuid='22222222-2222-4222-8222-222222222222'
+third_uuid='55555555-5555-4555-8555-555555555555'
+fourth_uuid='66666666-6666-4666-8666-666666666666'
+auth_config="${TEST_TMP}/relay-auth.json"
+cat > "$auth_config" <<EOF
+{
+  "inbounds": [{
+    "type": "vless",
+    "tag": "vless-reality-in-20001",
+    "users": [{"uuid": "$old_uuid", "flow": "xtls-rprx-vision"}],
+    "tls": {"enabled": true, "reality": {"enabled": true}}
+  }],
+  "outbounds": [{"type": "direct", "tag": "relay-out-20001"}],
+  "route": {"rules": [{"inbound": "vless-reality-in-20001", "outbound": "relay-out-20001"}]}
+}
+EOF
+
+new_user=$(jq -n --arg u "$new_uuid" '{name:$u,uuid:$u,flow:"xtls-rprx-vision"}')
+new_outbound=$(jq -n '{type:"direct",tag:"relay-out-20001-u2"}')
+new_rule=$(jq -n --arg u "$new_uuid" '{inbound:"vless-reality-in-20001",auth_user:[$u],action:"route",outbound:"relay-out-20001-u2"}')
+_relay_apply_shared_route_config "$auth_config" 'vless-reality-in-20001' "$new_user" "$new_outbound" "$new_rule"
+jq -e --arg u "$old_uuid" '.inbounds[0].users[0] | .name == $u and .uuid == $u' "$auth_config" >/dev/null || fail 'legacy VLESS user was not normalized to name=UUID'
+jq -e --arg u "$old_uuid" '.route.rules[] | select(.outbound == "relay-out-20001") | .auth_user == [$u] and .action == "route"' "$auth_config" >/dev/null || fail 'legacy broad route was not converted to auth_user routing'
+jq -e --arg u "$new_uuid" '.route.rules[] | select(.outbound == "relay-out-20001-u2") | .auth_user == [$u]' "$auth_config" >/dev/null || fail 'new UUID route was not appended'
+
+for route_spec in "$third_uuid:relay-out-20001-u3" "$fourth_uuid:relay-out-20001-u4"; do
+    route_uuid="${route_spec%%:*}"
+    route_outbound="${route_spec#*:}"
+    new_user=$(jq -n --arg u "$route_uuid" '{name:$u,uuid:$u,flow:"xtls-rprx-vision"}')
+    new_outbound=$(jq -n --arg tag "$route_outbound" '{type:"direct",tag:$tag}')
+    new_rule=$(jq -n --arg u "$route_uuid" --arg tag "$route_outbound" '{inbound:"vless-reality-in-20001",auth_user:[$u],action:"route",outbound:$tag}')
+    _relay_apply_shared_route_config "$auth_config" 'vless-reality-in-20001' "$new_user" "$new_outbound" "$new_rule"
+done
+jq -e '.inbounds[0].users | length == 4' "$auth_config" >/dev/null || fail 'one entrance does not support four UUID users'
+jq -e '.route.rules | length == 4' "$auth_config" >/dev/null || fail 'four UUID users do not have four explicit routes'
+
+_relay_remove_route_config "$auth_config" 'vless-reality-in-20001' 'relay-out-20001-u2' "$new_uuid"
+jq -e --arg old "$old_uuid" --arg third "$third_uuid" --arg fourth "$fourth_uuid" '
+    [.inbounds[0].users[].uuid] | sort == ([$old,$third,$fourth] | sort)
+' "$auth_config" >/dev/null || fail 'deleting one UUID removed or changed another VLESS user'
+jq -e '.route.rules | length == 3' "$auth_config" >/dev/null || fail 'deleting one UUID removed another route'
+
+_relay_remove_route_config "$auth_config" 'vless-reality-in-20001' 'relay-out-20001-u3' "$third_uuid"
+_relay_remove_route_config "$auth_config" 'vless-reality-in-20001' 'relay-out-20001-u4' "$fourth_uuid"
+_relay_remove_route_config "$auth_config" 'vless-reality-in-20001' 'relay-out-20001' "$old_uuid"
+jq -e '.inbounds == [] and .outbounds == [] and .route.rules == []' "$auth_config" >/dev/null || fail 'deleting the final UUID did not remove the empty entrance'
+
+old_anytls_uuid='33333333-3333-4333-8333-333333333333'
+new_anytls_uuid='44444444-4444-4444-8444-444444444444'
+anytls_config="${TEST_TMP}/relay-anytls-auth.json"
+cat > "$anytls_config" <<EOF
+{
+  "inbounds": [{
+    "type": "anytls",
+    "tag": "anytls-in-20002",
+    "users": [{"name": "default", "password": "$old_anytls_uuid"}],
+    "tls": {"enabled": true}
+  }],
+  "outbounds": [{"type": "direct", "tag": "relay-out-20002"}],
+  "route": {"rules": [{"inbound": "anytls-in-20002", "outbound": "relay-out-20002"}]}
+}
+EOF
+
+new_user=$(jq -n --arg u "$new_anytls_uuid" '{name:$u,password:$u}')
+new_outbound=$(jq -n '{type:"direct",tag:"relay-out-20002-u2"}')
+new_rule=$(jq -n --arg u "$new_anytls_uuid" '{inbound:"anytls-in-20002",auth_user:[$u],action:"route",outbound:"relay-out-20002-u2"}')
+_relay_apply_shared_route_config "$anytls_config" 'anytls-in-20002' "$new_user" "$new_outbound" "$new_rule"
+jq -e --arg u "$old_anytls_uuid" '.inbounds[0].users[0] == {name:$u,password:$u}' "$anytls_config" >/dev/null || fail 'legacy AnyTLS user was not normalized to name=UUID'
+jq -e --arg u "$new_anytls_uuid" '.route.rules[] | select(.outbound == "relay-out-20002-u2") | .auth_user == [$u]' "$anytls_config" >/dev/null || fail 'AnyTLS UUID route was not appended'
+
+RELAY_AUX_DIR="$TEST_TMP"
+relay_links_file="${RELAY_AUX_DIR}/relay_links.json"
+cat > "$relay_links_file" <<'EOF'
+{
+  "vless-reality-in-20001": {
+    "link": "vless://old-user@example.test:20001?security=reality&pbk=public-key",
+    "node_name": "legacy-route"
+  }
+}
+EOF
+_relay_migrate_legacy_metadata 'vless-reality-in-20001' 'relay-out-20001'
+jq -e '.["relay-out-20001"].inbound_tag == "vless-reality-in-20001" and .["vless-reality-in-20001"] == null' "$relay_links_file" >/dev/null || fail 'legacy relay metadata was not migrated to the outbound index'
+route_metadata=$(jq -n '{link:"vless://new-user@example.test:20001",node_name:"new-route",auth_user:"new-user"}')
+_relay_store_route_metadata 'vless-reality-in-20001' 'relay-out-20001-u2' "$route_metadata"
+resolved_metadata=$(_relay_get_route_metadata 'vless-reality-in-20001' 'relay-out-20001-u2')
+assert_eq 'new-user' "$(echo "$resolved_metadata" | jq -r '.auth_user')" 'route metadata lookup by outbound'
+_relay_delete_route_metadata 'vless-reality-in-20001' 'relay-out-20001-u2'
+jq -e '.["relay-out-20001"] != null and .["relay-out-20001-u2"] == null' "$relay_links_file" >/dev/null || fail 'deleting one route metadata entry removed another route'
 
 printf 'credential helper tests: OK\n'

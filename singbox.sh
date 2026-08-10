@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="21"
+export SCRIPT_VERSION="22"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -2175,7 +2175,9 @@ _uninstall() {
     echo -e "  ${RED}-${NC} sing-box 二进制: ${SINGBOX_BIN}"
     echo -e "  ${RED}-${NC} yq 二进制: ${YQ_BINARY}"
     [ -f "${CLOUDFLARED_BIN}" ] && echo -e "  ${RED}-${NC} cloudflared 二进制: ${CLOUDFLARED_BIN}"
-    [ -f "/usr/local/bin/xray" ] && echo -e "  ${RED}-${NC} Xray 核心及配置: /usr/local/etc/xray/"
+    echo -e "  ${RED}-${NC} Xray 核心及配置: /usr/local/etc/xray/"
+    echo -e "  ${RED}-${NC} systemd/OpenRC 服务与定时重启文件"
+    echo -e "  ${RED}-${NC} 运行日志、PID 与 nftables 持久化规则"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
     echo ""
@@ -2183,55 +2185,71 @@ _uninstall() {
     read -p "$(echo -e ${YELLOW}"确定要执行卸载吗? (y/N): "${NC})" confirm_main
     [[ "$confirm_main" != "y" && "$confirm_main" != "Y" ]] && _info "卸载已取消。" && return
 
-    # 1. 停止服务
-    _manage_service "stop"
+    # 1. 停止主服务、中转服务和定时任务，并删除服务定义。
+    _manage_service "stop" 2>/dev/null || true
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        systemctl disable sing-box >/dev/null 2>&1
+        for service_unit in sing-box sing-box-relay sing-box-restart.timer; do
+            systemctl disable --now "$service_unit" >/dev/null 2>&1 || true
+        done
+        systemctl stop sing-box-restart.service >/dev/null 2>&1 || true
+        rm -f \
+            /etc/systemd/system/sing-box.service \
+            /etc/systemd/system/sing-box-relay.service \
+            /etc/systemd/system/sing-box-restart.service \
+            /etc/systemd/system/sing-box-restart.timer
         systemctl daemon-reload
+        systemctl reset-failed >/dev/null 2>&1 || true
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
         rc-update del sing-box default >/dev/null 2>&1
+        rc-update del sing-box-relay default >/dev/null 2>&1
+        rc-update del sing-box-timer default >/dev/null 2>&1
+        rc-service sing-box-relay stop >/dev/null 2>&1 || true
+        rc-service sing-box-timer stop >/dev/null 2>&1 || true
+        rm -f /etc/init.d/sing-box /etc/init.d/sing-box-relay /etc/init.d/sing-box-timer
+    fi
+    rm -f /usr/local/bin/sb-timer.sh /tmp/sing-box.pid
+
+    # 2. 先停止 Argo，避免删除元数据后无法定位残留进程。
+    _disable_argo_watchdog 2>/dev/null || true
+    _stop_all_argo_tunnels 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop cloudflared >/dev/null 2>&1 || true
+        systemctl disable cloudflared >/dev/null 2>&1 || true
     fi
 
-    # 2. 清理配置与日志
-    _info "正在清理配置文件与日志..."
+    # 3. 清理配置、计划任务、日志、PID 和 nftables 规则。
+    _info "正在清理配置文件、服务残留与日志..."
     _remove_log_cleanup
-    # 清理脚本创建的 nftables 规则
-    local pf_meta="${SINGBOX_DIR}/relay_pf.json"
-    [ ! -f "$pf_meta" ] && pf_meta="${SINGBOX_DIR}/pf_metadata.json"
-    if [ -f "$pf_meta" ] && command -v jq &>/dev/null; then
-        # 清理 DNS 动态刷新的 cron 任务
-        if crontab -l 2>/dev/null | grep -qF "# pf-dns-auto-refresh"; then
-            crontab -l 2>/dev/null | grep -vF "# pf-dns-auto-refresh" | crontab -
-        fi
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF "# pf-dns-auto-refresh"; then
+        crontab -l 2>/dev/null | grep -vF "# pf-dns-auto-refresh" | crontab -
     fi
     _remove_nftables_rules
-    rm -rf "${SINGBOX_DIR}" "${LOG_FILE}"
-    
-    # 3. 清理 Argo 隧道
-    if [ -f "${CLOUDFLARED_BIN}" ]; then
-        _info "正在清理 Argo 隧道..."
-        _disable_argo_watchdog 2>/dev/null
-        _stop_all_argo_tunnels 2>/dev/null
-        rm -f "${CLOUDFLARED_BIN}"
-        rm -rf "/etc/cloudflared"
-    fi
+    rm -f \
+        "${LOG_FILE}" \
+        "${ARGO_LOG_FILE}" \
+        /tmp/sing-box.pid \
+        /tmp/xray.pid \
+        /tmp/singbox_argo_*.pid \
+        /tmp/singbox_argo_*.log
+    rm -rf "${SINGBOX_DIR}" /etc/cloudflared
+    rm -f "${CLOUDFLARED_BIN}"
 
-    # 4. 清理 Xray 核心 (如果已安装)
-    if [ -f "/usr/local/bin/xray" ]; then
+    # 4. 无条件清理 Xray 服务、核心和配置，覆盖二进制已丢失但配置仍残留的情况。
+    if [ -f "/usr/local/bin/xray" ] || [ -d "/usr/local/etc/xray" ] || \
+       [ -f "/etc/systemd/system/xray.service" ] || [ -f "/etc/init.d/xray" ]; then
         _info "正在清理 Xray 核心..."
-        if [ "$INIT_SYSTEM" == "systemd" ]; then
-            systemctl stop xray 2>/dev/null
-            systemctl disable xray 2>/dev/null
-            rm -f /etc/systemd/system/xray.service
-            systemctl daemon-reload
-        elif [ "$INIT_SYSTEM" == "openrc" ]; then
-            rc-service xray stop 2>/dev/null
-            rc-update del xray default 2>/dev/null
-            rm -f /etc/init.d/xray
-        fi
-        rm -f "/usr/local/bin/xray"
-        rm -rf "/usr/local/etc/xray"
     fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop xray >/dev/null 2>&1 || true
+        systemctl disable xray >/dev/null 2>&1 || true
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service xray stop >/dev/null 2>&1 || true
+        rc-update del xray default >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/xray.service /etc/init.d/xray /usr/local/bin/xray
+    rm -rf /usr/local/etc/xray
+    [ "$INIT_SYSTEM" == "systemd" ] && systemctl daemon-reload
 
     # 5. 清理组件脚本与别名 (双重清理，防止目录合并后的物理残留)
     _info "正在清理周边环境..."
@@ -2239,14 +2257,14 @@ _uninstall() {
     rm -f "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh"
     rm -f "/usr/local/bin/sb"
     
-    # 5. 复原 MOTD
+    # 6. 复原 MOTD
     if [ -f "/etc/motd" ]; then
         sed -i '/sing-box 节点信息/d' /etc/motd 2>/dev/null
         sed -i '/====/d' /etc/motd 2>/dev/null
         sed -i '/Base64 订阅/d' /etc/motd 2>/dev/null
     fi
 
-    # 6. 处理主程序 (考虑与线路机共用)
+    # 7. 处理主程序 (考虑与线路机共用)
     local relay_script="/root/relay-install.sh"
     if [ -f "$relay_script" ]; then
         _warn "检测到 [线路机] 脚本存在，为保持其运行，将 [保留] sing-box 主程序。"
@@ -2600,7 +2618,7 @@ _show_node_link() {
             # 参数: password, sni, ws_path, skip_verify
             local password="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4" cert_path="$5"
             local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            url="trojan://$(_url_encode "$password")@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "hysteria2")
             # 参数: password, sni, obfs_password(可选), port_hopping(可选)
@@ -2611,23 +2629,23 @@ _show_node_link() {
             local pin_param=""
             local cert_pcs=$(_cert_sha256_hex "$cert_path")
             [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
-            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
+            url="hysteria2://$(_url_encode "$password")@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
             ;;
         "tuic")
             # 参数: uuid, password, sni
             local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}"
-            url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
+            url="tuic://${uuid}:$(_url_encode "$password")@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
             ;;
         "anytls")
             # 参数: password, sni, skip_verify
             local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3" cert_path="$4"
             local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            url="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "any-reality")
             # 参数: password, sni, public_key, short_id
             local password="$1" sni="${2:-$DEFAULT_SNI}" public_key="$3" short_id="$4"
-            url="anytls://${password}@${link_ip}:${port}?security=reality&sni=${sni}&fp=chrome&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+            url="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=reality&sni=${sni}&fp=chrome&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
             ;;
         "shadowsocks")
             # 参数: method, password
@@ -3276,12 +3294,69 @@ _add_trojan_ws_tls() {
     _show_node_link "trojan-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$password" "$camouflage_domain" "$ws_path" "$skip_verify" "$cert_path"
 }
 
+# 读取 AnyTLS padding_scheme，支持交互逐行输入和批量 JSON 预设。
+# 参数：
+#   $1 - 接收 padding_scheme JSON 数组的变量名。
+#   $2 - 可选的 JSON 数组预设；批量模式为空时读取 BATCH_ANYTLS_PADDING_SCHEME。
+# 输出：将校验通过的 JSON 数组写入第一个参数指定的变量；null 表示使用核心默认值。
+_resolve_anytls_padding_scheme() {
+    local output_var="$1"
+    local preset_json="${2:-}"
+    local padding_json=""
+    local padding_line=""
+    local line_number=1
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || {
+        _error "无效的 padding_scheme 接收变量名: ${output_var}"
+        return 1
+    }
+
+    if [ -n "$preset_json" ]; then
+        padding_json="$preset_json"
+    elif [ "${BATCH_MODE:-false}" == "true" ]; then
+        padding_json="${BATCH_ANYTLS_PADDING_SCHEME:-null}"
+    else
+        echo ""
+        _info "请输入 AnyTLS padding_scheme，每行一条；第一行回车使用 sing-box 核心默认值。"
+        read -r -p "  第 1 条规则: " padding_line || return 1
+        if [ -z "$padding_line" ]; then
+            padding_json="null"
+        else
+            padding_json=$(jq -n --arg line "$padding_line" '[$line]') || return 1
+            line_number=2
+            while true; do
+                read -r -p "  第 ${line_number} 条规则 (回车结束): " padding_line || return 1
+                [ -n "$padding_line" ] || break
+                padding_json=$(printf '%s' "$padding_json" | jq --arg line "$padding_line" '. + [$line]') || return 1
+                ((line_number++))
+            done
+        fi
+    fi
+
+    if ! printf '%s' "$padding_json" | jq -e '. == null or (type == "array" and length > 0 and all(.[]; type == "string" and length > 0))' >/dev/null 2>&1; then
+        _error "AnyTLS padding_scheme 必须是 null 或至少包含一条非空字符串的 JSON 数组。"
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$(printf '%s' "$padding_json" | jq -c '.')"
+}
+
+# 创建使用普通 TLS 的 AnyTLS 主节点。
+# 参数：
+#   $1 - 客户端连接的服务器地址。
+#   $2 - 服务端监听端口。
+#   $3 - TLS 服务器名称。
+#   $4 - AnyTLS 密码/UUID，同时作为认证用户名。
+#   $5 - 节点显示名称。
+# 输出：写入服务端、YAML 和元数据配置，并显示分享链接。
 _create_anytls_tls_node() {
     local node_ip="$1"
     local port="$2"
     local server_name="$3"
     local password="$4"
     local name="$5"
+    local padding_scheme_json=""
+
+    _resolve_anytls_padding_scheme padding_scheme_json || return 1
 
     # --- 步骤 4: 证书选择 ---
     local cert_choice="1"
@@ -3340,24 +3415,21 @@ _create_anytls_tls_node() {
         --arg sn "$server_name" \
         --arg cp "$cert_path" \
         --arg kp "$key_path" \
+        --argjson padding "$padding_scheme_json" \
         '{
             "type": "anytls",
             "tag": $t,
             "listen": "::",
             "listen_port": ($p|tonumber),
-            "users": [{"name": "default", "password": $pw}],
-            "padding_scheme": [
-                "stop=2",
-                "0=100-200",
-                "1=100-200"
-            ],
+            "users": [{"name": $pw, "password": $pw}],
             "tls": {
                 "enabled": true,
                 "alpn": ["http/1.1"],
                 "certificate_path": $cp,
                 "key_path": $kp
             }
-        }')
+        }
+        | if $padding != null then .padding_scheme = $padding else . end')
     
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
     
@@ -3398,12 +3470,23 @@ _create_anytls_tls_node() {
     if [ "$skip_verify" == "true" ]; then
         insecure_param="&insecure=1"
     fi
-    local share_link="anytls://${password}@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
+    local share_link="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
     
     _success "AnyTLS 节点 [${name}] 添加成功!"
     _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify"
 }
 
+# 创建使用 Reality 的 AnyTLS 主节点。
+# 参数：
+#   $1 - 客户端连接的服务器地址。
+#   $2 - 服务端监听端口。
+#   $3 - Reality 服务器名称。
+#   $4 - AnyTLS 密码/UUID，同时作为认证用户名。
+#   $5 - 节点显示名称。
+#   $6 - Reality private key。
+#   $7 - Reality public key。
+#   $8 - Reality short ID。
+# 输出：写入服务端和元数据配置，并显示 Any-Reality 分享链接。
 _create_anyreality_node() {
     local node_ip="$1"
     local port="$2"
@@ -3437,7 +3520,7 @@ _create_anyreality_node() {
             "tag": $t,
             "listen": "::",
             "listen_port": ($p|tonumber),
-            "users": [{"name": "default", "password": $pw}],
+            "users": [{"name": $pw, "password": $pw}],
             "padding_scheme": [],
             "tls": {
                 "enabled": true,
@@ -3459,7 +3542,7 @@ _create_anyreality_node() {
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
-    local share_link="anytls://${password}@${link_ip}:${port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+    local share_link="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
     local meta_json
     meta_json=$(jq -n \
         --arg type "any-reality" \
@@ -3585,6 +3668,9 @@ _add_anytls() {
     [ "$created" = true ]
 }
 
+# 交互创建 VLESS-Reality 主节点。
+# 参数：无。
+# 输出：写入 name 与 UUID 一致的 VLESS 用户并生成客户端配置。
 _add_vless_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
@@ -3629,7 +3715,7 @@ _add_vless_reality() {
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
     
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pk "$private_key" --arg sid "$short_id" \
-        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":$u,"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\"}}" || return 1
     
@@ -4357,7 +4443,7 @@ _view_nodes() {
                 
                 if [ "$transport_type" == "ws" ]; then
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
-                    url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
+                    url="trojan://$(_url_encode "$password")@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
                     
                     # Argo 节点元数据已迁移到 argo_metadata.json
                     local argo_domain=""
@@ -4366,11 +4452,11 @@ _view_nodes() {
                     fi
                     if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
                         local argo_ws_path=$(_ws_path_with_early_data "$ws_path")
-                        url="trojan://${password}@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$argo_ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                        url="trojan://$(_url_encode "$password")@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$argo_ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                     fi
                 else
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
-                    url="trojan://${password}@${link_ip}:${port}?security=tls&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
+                    url="trojan://$(_url_encode "$password")@${link_ip}:${port}?security=tls&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
                 fi
                 ;;
             "hysteria2")
@@ -4383,14 +4469,14 @@ _view_nodes() {
                 local obfs_param=""; [[ -n "$op" && "$op" != "null" ]] && obfs_param="&obfs=salamander&obfs-password=$(_url_encode "${op}")"
                 # 端口跳跃参数
                 local hop_param=""; [[ -n "$hop" && "$hop" != "null" ]] && hop_param="&mport=${hop}&ports=${hop}"
-                url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$display_name")"
+                url="hysteria2://$(_url_encode "$pw")@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$display_name")"
                 ;;
             "tuic")
                 # [资源优化] 合并2次jq为1次
                 local uuid pw
                 IFS=$'\t' read -r uuid pw <<< "$(echo "$node" | jq -r '[.users[0].uuid, .users[0].password] | @tsv')"
                 local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
-                url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
+                url="tuic://${uuid}:$(_url_encode "$pw")@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
                 ;;
             "anytls")
                 # [资源优化] 合并2次jq为1次
@@ -4402,7 +4488,7 @@ _view_nodes() {
                 if [ "$skip_verify" == "true" ]; then
                     insecure_param="&insecure=1"
                 fi
-                url="anytls://${pw}@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
+                url="anytls://$(_url_encode "$pw")@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
                 ;;
             "shadowsocks")
                 # [资源优化] 合并2次jq为1次
@@ -4513,17 +4599,21 @@ _delete_node() {
             done
             _save_nftables_rules 2>/dev/null
         fi
+
+        # 只删除主配置中列出的节点证书，避免误删中转配置的证书。
+        for owned_tag in "${inbound_tags[@]}"; do
+            [[ "$owned_tag" =~ ^[a-zA-Z0-9._-]+$ ]] || continue
+            rm -f "${SINGBOX_DIR}/${owned_tag}.pem" "${SINGBOX_DIR}/${owned_tag}.key"
+        done
+
+        # 只移除本次列出的主节点，保留同一 YAML 中的中转节点。
+        for owned_name in "${display_names[@]}"; do
+            [ -n "$owned_name" ] && _remove_node_from_yaml "$owned_name"
+        done
         
         # 清空配置
         _atomic_modify_json "$CONFIG_FILE" '.inbounds = []'
         _atomic_modify_json "$METADATA_FILE" '{}'
-        
-        # 清空 clash.yaml 中的代理
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxies = []'
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies = ["DIRECT"])'
-        
-        # 删除所有证书文件
-        rm -f ${SINGBOX_DIR}/*.pem ${SINGBOX_DIR}/*.key 2>/dev/null
         
         _success "所有节点已删除！"
         _manage_service "restart"
@@ -5169,31 +5259,59 @@ _update_script() {
     
     for script_name in "${sub_scripts[@]}"; do
         local updated=false
-        # 多路径检测：1. 辅助目录 2. 当前脚本同级目录
-        local paths_to_check=("${SINGBOX_DIR}/${script_name}" "${SCRIPT_DIR}/${script_name}")
-        
+        local update_failed=false
+        local active_script_path="${SCRIPT_DIR}/${script_name}"
+        local fallback_script_path="${SINGBOX_DIR}/${script_name}"
+        local paths_to_check=()
+        local installed_paths=()
+        local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
+        local temp_sub_path="${SELF_SCRIPT_PATH}.${script_name}.tmp"
+
+        # 路径顺序与启动逻辑一致；两个副本同时存在时全部更新，避免运行旧副本。
+        paths_to_check+=("$active_script_path")
+        [ "$fallback_script_path" != "$active_script_path" ] && paths_to_check+=("$fallback_script_path")
         for script_path in "${paths_to_check[@]}"; do
-            if [ -f "$script_path" ]; then
-                local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
-                local temp_sub_path="${script_path}.tmp"
-                
-                _info "正在更新子脚本: ${script_name} -> ${script_path}..."
-                if wget -qO "$temp_sub_path" "$script_url"; then
-                    if [ -s "$temp_sub_path" ]; then
-                        chmod +x "$temp_sub_path"
-                        mv "$temp_sub_path" "$script_path"
-                        updated=true
-                        break
-                    else
-                        rm -f "$temp_sub_path"
-                    fi
-                else
-                    rm -f "$temp_sub_path"
-                fi
+            [ -f "$script_path" ] && installed_paths+=("$script_path")
+        done
+
+        if [ "${#installed_paths[@]}" -eq 0 ]; then
+            _warning "子脚本 ${script_name} 未安装，跳过更新。"
+            continue
+        fi
+
+        _info "正在下载并校验子脚本: ${script_name}..."
+        if ! wget -qO "$temp_sub_path" "$script_url"; then
+            _warning "子脚本 ${script_name} 下载失败，保留现有文件。"
+            rm -f "$temp_sub_path"
+            continue
+        fi
+        if [ ! -s "$temp_sub_path" ] || ! head -n 1 "$temp_sub_path" | grep -Eq '^#!.*bash' || \
+           ! bash -n "$temp_sub_path" 2>/dev/null; then
+            _warning "子脚本 ${script_name} 内容或 Bash 语法无效，已拒绝覆盖。"
+            rm -f "$temp_sub_path"
+            continue
+        fi
+
+        for script_path in "${installed_paths[@]}"; do
+            local target_temp_path="${script_path}.tmp"
+            _info "正在更新子脚本: ${script_name} -> ${script_path}..."
+            if cp "$temp_sub_path" "$target_temp_path" && chmod +x "$target_temp_path" && mv "$target_temp_path" "$script_path"; then
+                updated=true
+            else
+                update_failed=true
+                _warning "子脚本写入失败: ${script_path}"
+                rm -f "$target_temp_path"
             fi
         done
-        
-        [ "$updated" = true ] && _success "子脚本 (${script_name}) 更新成功。" || _warning "子脚本 ${script_name} 未发现运行中实例或下载失败，跳过更新。"
+        rm -f "$temp_sub_path"
+
+        if [ "$updated" = true ] && [ "$update_failed" = false ]; then
+            _success "子脚本 (${script_name}) 的全部已安装副本更新成功。"
+        elif [ "$updated" = true ]; then
+            _warning "子脚本 ${script_name} 仅部分副本更新成功，请检查上方失败路径。"
+        else
+            _warning "子脚本 ${script_name} 更新失败，已保留原文件。"
+        fi
     done
     
     # 更新 yq 工具（如果缺失或版本过旧）
