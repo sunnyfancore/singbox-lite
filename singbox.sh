@@ -188,16 +188,23 @@ _validate_credential() {
 
 # 解析手动输入或自动生成的凭据，交互输入始终可见。
 # 参数：
-#   $1 - 输入提示文本。
-#   $2 - 自动生成器类型，例如 uuid、rand-hex:16 或 rand-base64:32。
-#   $3 - 凭据校验器类型，例如 nonempty、uuid 或 base64-bytes:32。
-#   $4 - 可选的预设凭据；为空时进入交互输入或自动生成。
-# 输出：校验通过的凭据。
+#   $1 - 接收凭据的变量名。
+#   $2 - 输入提示文本。
+#   $3 - 自动生成器类型，例如 uuid、rand-hex:16 或 rand-base64:32。
+#   $4 - 凭据校验器类型，例如 nonempty、uuid 或 base64-bytes:32。
+#   $5 - 可选的预设凭据；为空时进入交互输入或自动生成。
+# 输出：将校验通过的凭据写入第一个参数指定的变量。
 _resolve_credential() {
-    local prompt="$1"
-    local generator="$2"
-    local validator="$3"
-    local value="${4:-}"
+    local output_var="$1"
+    local prompt="$2"
+    local generator="$3"
+    local validator="$4"
+    local value="${5:-}"
+
+    [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || {
+        _error "无效的凭据接收变量名: ${output_var}"
+        return 1
+    }
 
     if [ -z "$value" ] && [ "${BATCH_MODE:-false}" != "true" ]; then
         read -r -p "${prompt} (回车随机生成): " value || return 1
@@ -211,7 +218,7 @@ _resolve_credential() {
     fi
 
     _validate_credential "$validator" "$value" || return 1
-    printf '%s' "$value"
+    printf -v "$output_var" '%s' "$value"
 }
 
 # 解析 Reality 密钥对和 short ID，交互输入始终可见。
@@ -1174,7 +1181,7 @@ _add_argo_node() {
     # === [协议特定] Trojan 密码输入 ===
     local password=""
     if [ "$protocol" == "trojan" ]; then
-        password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty) || return 1
+        _resolve_credential password "请输入 Trojan 密码" "rand-hex:16" nonempty || return 1
     fi
 
     # === [公共] 隧道模式选择 ===
@@ -1241,7 +1248,7 @@ _add_argo_node() {
     local inbound_json=""
 
     if [ "$protocol" == "vless" ]; then
-        uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
+        _resolve_credential uuid "请输入 VLESS UUID" uuid uuid || return 1
         inbound_json=$(jq -n \
             --arg t "$tag" \
             --arg p "$port" \
@@ -2792,7 +2799,7 @@ _add_vless_ws_tls() {
     fi
 
     local uuid=""
-    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
+    _resolve_credential uuid "请输入 VLESS UUID" uuid uuid || return 1
 
     # 提前定义 tag，用于证书文件命名
     local tag="vless-ws-in-${port}"
@@ -2972,7 +2979,7 @@ _add_vless_grpc_tls() {
     fi
 
     local uuid=""
-    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
+    _resolve_credential uuid "请输入 VLESS UUID" uuid uuid || return 1
 
     local tag="vless-grpc-in-${port}"
     local cert_path=""
@@ -3142,7 +3149,7 @@ _add_trojan_ws_tls() {
     fi
 
     local password=""
-    password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty) || return 1
+    _resolve_credential password "请输入 Trojan 密码" "rand-hex:16" nonempty || return 1
 
     # 提前定义 tag，用于证书文件命名
     local tag="trojan-ws-in-${port}"
@@ -3515,7 +3522,7 @@ _add_anytls() {
     fi
 
     local password=""
-    password=$(_resolve_credential "请输入 AnyTLS 密码/UUID" uuid nonempty) || return 1
+    _resolve_credential password "请输入 AnyTLS 密码/UUID" uuid nonempty || return 1
 
     local reality_private_key=""
     local reality_public_key=""
@@ -3611,7 +3618,7 @@ _add_vless_reality() {
     fi
 
     local uuid=""
-    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
+    _resolve_credential uuid "请输入 VLESS UUID" uuid uuid || return 1
     _resolve_reality_credentials || return 1
     local private_key="$REALITY_PRIVATE_KEY"
     local public_key="$REALITY_PUBLIC_KEY"
@@ -3664,7 +3671,7 @@ _add_vless_tcp() {
     fi
 
     local uuid=""
-    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
+    _resolve_credential uuid "请输入 VLESS UUID" uuid uuid || return 1
     local tag="vless-tcp-in-${port}"
     # IPv6处理：YAML用原始IP，链接用带[]的IP
     local yaml_ip="$node_ip"
@@ -3701,7 +3708,7 @@ _add_hysteria2() {
         # 批量模式 double check
         [ -z "$node_ip" ] && node_ip="$server_ip"
         if [ "$BATCH_HY2_OBFS" != "none" ]; then
-            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty) || return 1
+            _resolve_credential obfs_password "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty || return 1
         fi
         port_hopping="$BATCH_HY2_HOP"
         if [ -n "$port_hopping" ]; then
@@ -3748,11 +3755,11 @@ _add_hysteria2() {
     local key_path="${SINGBOX_DIR}/${tag}.key"
 
     local password=""
-    password=$(_resolve_credential "请输入 Hysteria2 密码" "rand-hex:16" nonempty) || return 1
+    _resolve_credential password "请输入 Hysteria2 密码" "rand-hex:16" nonempty || return 1
     if [ "$BATCH_MODE" != "true" ]; then
         read -p "是否开启 QUIC 流量混淆 (salamander)? (y/N): " h_choice
         if [[ "$h_choice" == "y" ]]; then
-            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty) || return 1
+            _resolve_credential obfs_password "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty || return 1
         fi
         read -p "是否开启端口跳跃? (y/N): " hop_choice
         if [[ "$hop_choice" == "y" ]]; then
@@ -3913,8 +3920,8 @@ _add_tuic() {
 
     local uuid=""
     local password=""
-    uuid=$(_resolve_credential "请输入 TUIC UUID" uuid uuid) || return 1
-    password=$(_resolve_credential "请输入 TUIC 密码" "rand-hex:16" nonempty) || return 1
+    _resolve_credential uuid "请输入 TUIC UUID" uuid uuid || return 1
+    _resolve_credential password "请输入 TUIC 密码" "rand-hex:16" nonempty || return 1
 
     _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
     
@@ -4027,7 +4034,7 @@ _add_shadowsocks_menu() {
     esac
 
     if [ "$method" != "none" ]; then
-        password=$(_resolve_credential "请输入 Shadowsocks 密码/密钥" "$password_generator" "$password_validator") || return 1
+        _resolve_credential password "请输入 Shadowsocks 密码/密钥" "$password_generator" "$password_validator" || return 1
     fi
 
     local node_ip="${server_ip}"
@@ -4060,7 +4067,7 @@ _add_shadowsocks_menu() {
     local shadowtls_password=""
     local shadowtls_sni="www.amd.com"
     if [ "$use_shadowtls" == "true" ]; then
-        shadowtls_password=$(_resolve_credential "请输入 ShadowTLS 密码" "rand-hex:16" nonempty) || return 1
+        _resolve_credential shadowtls_password "请输入 ShadowTLS 密码" "rand-hex:16" nonempty || return 1
         if [ "$BATCH_MODE" = "true" ]; then
             shadowtls_sni="${BATCH_SNI:-www.amd.com}"
         else
@@ -4217,8 +4224,8 @@ _add_socks() {
             break
         done
     fi
-    username=$(_resolve_credential "请输入 SOCKS5 用户名" "rand-hex:8" nonempty) || return 1
-    password=$(_resolve_credential "请输入 SOCKS5 密码" "rand-hex:16" nonempty) || return 1
+    _resolve_credential username "请输入 SOCKS5 用户名" "rand-hex:8" nonempty || return 1
+    _resolve_credential password "请输入 SOCKS5 密码" "rand-hex:16" nonempty || return 1
     local tag="socks-in-${port}"
     local name="Batch-SOCKS5-${port}"
     [ "$BATCH_MODE" != "true" ] && name="SOCKS5-${port}"
