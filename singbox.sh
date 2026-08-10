@@ -186,21 +186,21 @@ _validate_credential() {
     esac
 }
 
-# 交互模式允许输入自定义值；直接回车或批量模式下自动生成。
+# 解析手动输入或自动生成的凭据，交互输入始终可见。
+# 参数：
+#   $1 - 输入提示文本。
+#   $2 - 自动生成器类型，例如 uuid、rand-hex:16 或 rand-base64:32。
+#   $3 - 凭据校验器类型，例如 nonempty、uuid 或 base64-bytes:32。
+#   $4 - 可选的预设凭据；为空时进入交互输入或自动生成。
+# 输出：校验通过的凭据。
 _resolve_credential() {
     local prompt="$1"
     local generator="$2"
     local validator="$3"
-    local secret="${4:-false}"
-    local value="${5:-}"
+    local value="${4:-}"
 
     if [ -z "$value" ] && [ "${BATCH_MODE:-false}" != "true" ]; then
-        if [ "$secret" = "true" ]; then
-            read -r -s -p "${prompt} (回车随机生成): " value || { echo >&2; return 1; }
-            echo >&2
-        else
-            read -r -p "${prompt} (回车随机生成): " value || return 1
-        fi
+        read -r -p "${prompt} (回车随机生成): " value || return 1
     fi
 
     if [ -z "$value" ]; then
@@ -214,7 +214,9 @@ _resolve_credential() {
     printf '%s' "$value"
 }
 
-# 输出到 REALITY_PRIVATE_KEY / REALITY_PUBLIC_KEY / REALITY_SHORT_ID。
+# 解析 Reality 密钥对和 short ID，交互输入始终可见。
+# 参数：无。
+# 输出：写入 REALITY_PRIVATE_KEY、REALITY_PUBLIC_KEY、REALITY_SHORT_ID 和 REALITY_INPUT_PROVIDED。
 _resolve_reality_credentials() {
     local private_key="${BATCH_REALITY_PRIVATE_KEY:-}"
     local public_key="${BATCH_REALITY_PUBLIC_KEY:-}"
@@ -223,8 +225,7 @@ _resolve_reality_credentials() {
     local input_provided=false
 
     if [ "${BATCH_MODE:-false}" != "true" ]; then
-        read -r -s -p "请输入 Reality private_key (与 public_key 同时留空则随机生成): " private_key || { echo >&2; return 1; }
-        echo >&2
+        read -r -p "请输入 Reality private_key (与 public_key 同时留空则随机生成): " private_key || return 1
         read -r -p "请输入 Reality public_key (与 private_key 同时留空则随机生成): " public_key || return 1
         read -r -p "请输入 Reality short_id (回车随机生成): " short_id || return 1
     fi
@@ -1173,7 +1174,7 @@ _add_argo_node() {
     # === [协议特定] Trojan 密码输入 ===
     local password=""
     if [ "$protocol" == "trojan" ]; then
-        password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty true) || return 1
+        password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty) || return 1
     fi
 
     # === [公共] 隧道模式选择 ===
@@ -3141,7 +3142,7 @@ _add_trojan_ws_tls() {
     fi
 
     local password=""
-    password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty true) || return 1
+    password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty) || return 1
 
     # 提前定义 tag，用于证书文件命名
     local tag="trojan-ws-in-${port}"
@@ -3514,7 +3515,7 @@ _add_anytls() {
     fi
 
     local password=""
-    password=$(_resolve_credential "请输入 AnyTLS 密码/UUID" uuid nonempty true) || return 1
+    password=$(_resolve_credential "请输入 AnyTLS 密码/UUID" uuid nonempty) || return 1
 
     local reality_private_key=""
     local reality_public_key=""
@@ -3700,7 +3701,7 @@ _add_hysteria2() {
         # 批量模式 double check
         [ -z "$node_ip" ] && node_ip="$server_ip"
         if [ "$BATCH_HY2_OBFS" != "none" ]; then
-            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty true) || return 1
+            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty) || return 1
         fi
         port_hopping="$BATCH_HY2_HOP"
         if [ -n "$port_hopping" ]; then
@@ -3747,11 +3748,11 @@ _add_hysteria2() {
     local key_path="${SINGBOX_DIR}/${tag}.key"
 
     local password=""
-    password=$(_resolve_credential "请输入 Hysteria2 密码" "rand-hex:16" nonempty true) || return 1
+    password=$(_resolve_credential "请输入 Hysteria2 密码" "rand-hex:16" nonempty) || return 1
     if [ "$BATCH_MODE" != "true" ]; then
         read -p "是否开启 QUIC 流量混淆 (salamander)? (y/N): " h_choice
         if [[ "$h_choice" == "y" ]]; then
-            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty true) || return 1
+            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty) || return 1
         fi
         read -p "是否开启端口跳跃? (y/N): " hop_choice
         if [[ "$hop_choice" == "y" ]]; then
@@ -3913,7 +3914,7 @@ _add_tuic() {
     local uuid=""
     local password=""
     uuid=$(_resolve_credential "请输入 TUIC UUID" uuid uuid) || return 1
-    password=$(_resolve_credential "请输入 TUIC 密码" "rand-hex:16" nonempty true) || return 1
+    password=$(_resolve_credential "请输入 TUIC 密码" "rand-hex:16" nonempty) || return 1
 
     _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
     
@@ -4026,7 +4027,7 @@ _add_shadowsocks_menu() {
     esac
 
     if [ "$method" != "none" ]; then
-        password=$(_resolve_credential "请输入 Shadowsocks 密码/密钥" "$password_generator" "$password_validator" true) || return 1
+        password=$(_resolve_credential "请输入 Shadowsocks 密码/密钥" "$password_generator" "$password_validator") || return 1
     fi
 
     local node_ip="${server_ip}"
@@ -4059,7 +4060,7 @@ _add_shadowsocks_menu() {
     local shadowtls_password=""
     local shadowtls_sni="www.amd.com"
     if [ "$use_shadowtls" == "true" ]; then
-        shadowtls_password=$(_resolve_credential "请输入 ShadowTLS 密码" "rand-hex:16" nonempty true) || return 1
+        shadowtls_password=$(_resolve_credential "请输入 ShadowTLS 密码" "rand-hex:16" nonempty) || return 1
         if [ "$BATCH_MODE" = "true" ]; then
             shadowtls_sni="${BATCH_SNI:-www.amd.com}"
         else
@@ -4217,7 +4218,7 @@ _add_socks() {
         done
     fi
     username=$(_resolve_credential "请输入 SOCKS5 用户名" "rand-hex:8" nonempty) || return 1
-    password=$(_resolve_credential "请输入 SOCKS5 密码" "rand-hex:16" nonempty true) || return 1
+    password=$(_resolve_credential "请输入 SOCKS5 密码" "rand-hex:16" nonempty) || return 1
     local tag="socks-in-${port}"
     local name="Batch-SOCKS5-${port}"
     [ "$BATCH_MODE" != "true" ] && name="SOCKS5-${port}"

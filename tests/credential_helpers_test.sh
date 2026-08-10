@@ -62,12 +62,17 @@ generated_uuid=$(_resolve_credential UUID uuid uuid)
 assert_eq '123e4567-e89b-12d3-a456-426614174000' "$generated_uuid" 'UUID generation'
 
 custom_uuid='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-resolved_uuid=$(_resolve_credential UUID uuid uuid false "$custom_uuid")
+resolved_uuid=$(_resolve_credential UUID uuid uuid "$custom_uuid")
 assert_eq "$custom_uuid" "$resolved_uuid" 'custom UUID preservation'
 
-if _resolve_credential UUID uuid uuid false invalid >/dev/null 2>&1; then
+if _resolve_credential UUID uuid uuid invalid >/dev/null 2>&1; then
     fail 'invalid UUID was accepted'
 fi
+
+credential_function=$(declare -f _resolve_credential)
+[[ "$credential_function" != *'read -r -s'* ]] || fail 'credential input is still hidden'
+reality_function=$(declare -f _resolve_reality_credentials)
+[[ "$reality_function" != *'read -r -s'* ]] || fail 'Reality private key input is still hidden'
 
 key16=$(_generate_credential 'rand-base64:16')
 key32=$(_generate_credential 'rand-base64:32')
