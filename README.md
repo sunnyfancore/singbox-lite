@@ -13,6 +13,7 @@
 - 🔄 **智能管理** - 列表自动隐藏辅助节点，支持级联删除
 - 🌐 **IPv6 完美支持** - 自动处理 IPv6 地址格式
 - 🎯 **自定义名称** - 所有节点支持自定义命名
+- 🔐 **自定义凭据** - UUID、密码、Reality 密钥对和 short ID 均支持手动输入，留空时安全随机生成
 - 📊 **服务监控** - 主菜单实时显示 Sing-box / Argo / Xray 三大服务运行状态
 
 ### Xray 管理脚本 (xray_manager.sh)
@@ -52,6 +53,8 @@
 | VLESS-TCP | ✅ | ❌ | ✅ |
 | SOCKS5 | ✅ | ❌ | ❌ |
 
+Shadowsocks 支持 sing-box 入站的完整方法集：`aes-128-gcm`、`aes-192-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`xchacha20-ietf-poly1305`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm`、`2022-blake3-chacha20-poly1305` 和 `none`，并保留 Multiplex Padding、ShadowTLS v3 组合模式。
+
 ### Xray 协议
 
 | 协议 | V2rayN | Clash Verge | 说明 |
@@ -63,7 +66,7 @@
 | VLESS+XHTTP+TLS | ✅ | ❌ | CF H2回源，基于 XHTTP stream-one |
 | VLESS+gRPC+TLS | ✅ | ✅ | CF gRPC回源，需CF开启 gRPC |
 | Trojan+gRPC+TLS | ✅ | ✅ | CF gRPC回源，需CF开启 gRPC |
-| Shadowsocks | ✅ | ✅ | 支持 3 种加密方式 |
+| Shadowsocks | ✅ | ✅ | 支持完整加密方法集及组合模式 |
 
 > ⚠️ XHTTP 传输层节点仅支持 V2rayN 等 Xray 内核客户端，不支持 Clash Verge (mihomo)
 > 
@@ -344,3 +347,8 @@
 ### 2026.07.27
 - **优化日志问题**：连接日志流目前已加入自动清理机制，避免NAT类机器出现磁盘吃满的情况。
 - **加入DNS设置**：主菜单加入singbox配置文件自定义DNS地址。
+
+### 2026.08.09
+- **节点凭据自定义**：所有节点凭据统一为手动输入优先、留空随机生成；Reality 支持输入成对的 private/public key 和 short ID，并增加格式校验。
+- **Shadowsocks 方法补全**：补齐 sing-box 支持的经典 AEAD 与 Shadowsocks 2022 方法，增加对应密钥长度校验。
+- **批量创建加固**：增加 Shadowsocks 选项去重、端口双协议冲突检查和成功/失败统计，避免部分失败时误报全部成功。

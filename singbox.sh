@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="20"
+export SCRIPT_VERSION="21"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -108,6 +108,156 @@ _append_pcs_to_tls_link() {
 _ss_base64_encode() {
     # Shadowsocks SIP002 规范要求 Base64 编码不带填充 (No Padding)
     printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
+}
+
+_generate_credential() {
+    local generator="$1"
+    local length=""
+    local value=""
+
+    case "$generator" in
+        uuid)
+            value=$("${SINGBOX_BIN}" generate uuid 2>/dev/null) || return 1
+            ;;
+        rand-hex:*)
+            length="${generator#rand-hex:}"
+            [[ "$length" =~ ^[1-9][0-9]*$ ]] || return 1
+            value=$("${SINGBOX_BIN}" generate rand --hex "$length" 2>/dev/null) || return 1
+            ;;
+        rand-base64:*)
+            length="${generator#rand-base64:}"
+            [[ "$length" =~ ^[1-9][0-9]*$ ]] || return 1
+            value=$("${SINGBOX_BIN}" generate rand --base64 "$length" 2>/dev/null) || return 1
+            ;;
+        *)
+            _error "未知凭据生成类型: ${generator}"
+            return 1
+            ;;
+    esac
+
+    [ -n "$value" ] || { _error "凭据生成失败，请检查 sing-box 核心。"; return 1; }
+    printf '%s' "$value"
+}
+
+_validate_credential() {
+    local validator="$1"
+    local value="$2"
+    local expected_length=""
+    local actual_length=""
+
+    case "$validator" in
+        nonempty)
+            [ -n "$value" ] || { _error "凭据不能为空。"; return 1; }
+            ;;
+        uuid)
+            [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+                _error "UUID 格式错误，应为标准的 8-4-4-4-12 格式。"
+                return 1
+            }
+            ;;
+        reality-key)
+            [[ "$value" =~ ^[A-Za-z0-9_-]{43}$ ]] || {
+                _error "Reality 密钥格式错误，应为 43 位 Base64URL 字符串。"
+                return 1
+            }
+            ;;
+        short-id)
+            [[ "$value" =~ ^([0-9a-fA-F]{2}){1,8}$ ]] || {
+                _error "Reality short_id 应为 2-16 位偶数长度十六进制字符串。"
+                return 1
+            }
+            ;;
+        base64-bytes:*)
+            expected_length="${validator#base64-bytes:}"
+            if ! printf '%s' "$value" | base64 -d >/dev/null 2>&1; then
+                _error "Shadowsocks 2022 密钥不是有效的 Base64。"
+                return 1
+            fi
+            actual_length=$(printf '%s' "$value" | base64 -d 2>/dev/null | wc -c | tr -d '[:space:]')
+            if [ "$actual_length" != "$expected_length" ]; then
+                _error "Shadowsocks 2022 密钥解码后应为 ${expected_length} 字节，当前为 ${actual_length:-0} 字节。"
+                return 1
+            fi
+            ;;
+        *)
+            _error "未知凭据校验类型: ${validator}"
+            return 1
+            ;;
+    esac
+}
+
+# 交互模式允许输入自定义值；直接回车或批量模式下自动生成。
+_resolve_credential() {
+    local prompt="$1"
+    local generator="$2"
+    local validator="$3"
+    local secret="${4:-false}"
+    local value="${5:-}"
+
+    if [ -z "$value" ] && [ "${BATCH_MODE:-false}" != "true" ]; then
+        if [ "$secret" = "true" ]; then
+            read -r -s -p "${prompt} (回车随机生成): " value || { echo >&2; return 1; }
+            echo >&2
+        else
+            read -r -p "${prompt} (回车随机生成): " value || return 1
+        fi
+    fi
+
+    if [ -z "$value" ]; then
+        value=$(_generate_credential "$generator") || {
+            _error "无法生成 ${prompt}。"
+            return 1
+        }
+    fi
+
+    _validate_credential "$validator" "$value" || return 1
+    printf '%s' "$value"
+}
+
+# 输出到 REALITY_PRIVATE_KEY / REALITY_PUBLIC_KEY / REALITY_SHORT_ID。
+_resolve_reality_credentials() {
+    local private_key="${BATCH_REALITY_PRIVATE_KEY:-}"
+    local public_key="${BATCH_REALITY_PUBLIC_KEY:-}"
+    local short_id="${BATCH_REALITY_SHORT_ID:-}"
+    local keypair=""
+    local input_provided=false
+
+    if [ "${BATCH_MODE:-false}" != "true" ]; then
+        read -r -s -p "请输入 Reality private_key (与 public_key 同时留空则随机生成): " private_key || { echo >&2; return 1; }
+        echo >&2
+        read -r -p "请输入 Reality public_key (与 private_key 同时留空则随机生成): " public_key || return 1
+        read -r -p "请输入 Reality short_id (回车随机生成): " short_id || return 1
+    fi
+
+    if [ -n "$private_key" ] || [ -n "$public_key" ] || [ -n "$short_id" ]; then
+        input_provided=true
+    fi
+
+    if [ -z "$private_key" ] && [ -z "$public_key" ]; then
+        keypair=$("${SINGBOX_BIN}" generate reality-keypair 2>/dev/null) || {
+            _error "Reality 密钥对生成失败。"
+            return 1
+        }
+        private_key=$(printf '%s\n' "$keypair" | awk '/PrivateKey/ {print $2; exit}')
+        public_key=$(printf '%s\n' "$keypair" | awk '/PublicKey/ {print $2; exit}')
+    elif [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        _error "Reality private_key 和 public_key 必须同时输入或同时留空。"
+        return 1
+    else
+        if [ "${BATCH_MODE:-false}" != "true" ]; then
+            _warn "脚本只能校验 Reality 密钥格式，请确认 public_key 确实由该 private_key 生成。"
+        fi
+    fi
+
+    [ -n "$short_id" ] || short_id=$(_generate_credential "rand-hex:8") || return 1
+    _validate_credential reality-key "$private_key" || return 1
+    _validate_credential reality-key "$public_key" || return 1
+    _validate_credential short-id "$short_id" || return 1
+
+    REALITY_PRIVATE_KEY="$private_key"
+    REALITY_PUBLIC_KEY="$public_key"
+    REALITY_SHORT_ID="$short_id"
+    REALITY_INPUT_PROVIDED="$input_provided"
 }
 
 # 公网 IP 获取 (带全局缓存)
@@ -1014,7 +1164,7 @@ _add_argo_node() {
     # === [公共] WebSocket 路径 ===
     read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
     if [ -z "$ws_path" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+        ws_path="/$(_generate_credential "rand-hex:8")" || return 1
         _info "已生成随机路径: ${ws_path}"
     else
         [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
@@ -1023,11 +1173,7 @@ _add_argo_node() {
     # === [协议特定] Trojan 密码输入 ===
     local password=""
     if [ "$protocol" == "trojan" ]; then
-        read -p "请输入 Trojan 密码 (回车随机生成): " password
-        if [ -z "$password" ]; then
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
-            _info "已生成随机密码: ${password}"
-        fi
+        password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty true) || return 1
     fi
 
     # === [公共] 隧道模式选择 ===
@@ -1094,7 +1240,7 @@ _add_argo_node() {
     local inbound_json=""
 
     if [ "$protocol" == "vless" ]; then
-        uuid=$(${SINGBOX_BIN} generate uuid)
+        uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
         inbound_json=$(jq -n \
             --arg t "$tag" \
             --arg p "$port" \
@@ -1247,7 +1393,7 @@ _add_argo_node() {
             }')
     fi
 
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
 
     # === [公共] 启用守护 + 显示结果 ===
     _enable_argo_watchdog
@@ -2632,17 +2778,20 @@ _add_vless_ws_tls() {
     # --- 步骤 4: 路径 ---
     local ws_path=""
     if [ "$BATCH_MODE" = "true" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+        ws_path="/$(_generate_credential "rand-hex:8")" || return 1
     else
         read -p "请输入 WebSocket 路径 (回车则随机生成): " input_ws_path
         if [ -z "$input_ws_path" ]; then
-            ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+            ws_path="/$(_generate_credential "rand-hex:8")" || return 1
             _info "已为您生成随机 WebSocket 路径: ${ws_path}"
         else
             ws_path="$input_ws_path"
             [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
         fi
     fi
+
+    local uuid=""
+    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
 
     # 提前定义 tag，用于证书文件命名
     local tag="vless-ws-in-${port}"
@@ -2699,8 +2848,6 @@ _add_vless_ws_tls() {
         name=${custom_name:-$default_name}
     fi
 
-    local uuid=$(${SINGBOX_BIN} generate uuid)
-    
     # Inbound (服务器端) 配置
     local inbound_json=$(jq -n \
         --arg t "$tag" \
@@ -2759,7 +2906,7 @@ _add_vless_ws_tls() {
                 }
             }')
             
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     _success "VLESS (WebSocket+TLS) 节点 [${name}] 添加成功!"
     _success "客户端连接地址 (server): ${client_server_addr}"
     _success "客户端连接端口 (port): ${client_port}"
@@ -2810,7 +2957,8 @@ _add_vless_grpc_tls() {
 
     local client_port="$port"
 
-    local generated_service_name="grpc-$(${SINGBOX_BIN} generate rand --hex 4)"
+    local generated_service_name=""
+    generated_service_name="grpc-$(_generate_credential "rand-hex:4")" || return 1
     local service_name=""
     if [ "$BATCH_MODE" = "true" ]; then
         service_name="${BATCH_GRPC_SERVICE_NAME:-$generated_service_name}"
@@ -2821,6 +2969,9 @@ _add_vless_grpc_tls() {
         [[ -z "$service_name" ]] && _error "gRPC serviceName 不能为空" && return 1
         _info "gRPC serviceName: ${service_name}"
     fi
+
+    local uuid=""
+    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
 
     local tag="vless-grpc-in-${port}"
     local cert_path=""
@@ -2870,8 +3021,6 @@ _add_vless_grpc_tls() {
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
-
-    local uuid=$(${SINGBOX_BIN} generate uuid)
 
     local inbound_json=$(jq -n \
         --arg t "$tag" \
@@ -2926,7 +3075,7 @@ _add_vless_grpc_tls() {
                 }
             }')
 
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     _success "VLESS (gRPC+TLS) 节点 [${name}] 添加成功!"
     _success "客户端连接地址 (server): ${client_server_addr}"
     _success "客户端连接端口 (port): ${client_port}"
@@ -2979,17 +3128,20 @@ _add_trojan_ws_tls() {
     # --- 步骤 4: 路径 ---
     local ws_path=""
     if [ "$BATCH_MODE" = "true" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+        ws_path="/$(_generate_credential "rand-hex:8")" || return 1
     else
         read -p "请输入 WebSocket 路径 (回车则随机生成): " input_ws_path
         if [ -z "$input_ws_path" ]; then
-            ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+            ws_path="/$(_generate_credential "rand-hex:8")" || return 1
             _info "已为您生成随机 WebSocket 路径: ${ws_path}"
         else
             ws_path="$input_ws_path"
             [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
         fi
     fi
+
+    local password=""
+    password=$(_resolve_credential "请输入 Trojan 密码" "rand-hex:16" nonempty true) || return 1
 
     # 提前定义 tag，用于证书文件命名
     local tag="trojan-ws-in-${port}"
@@ -3033,20 +3185,6 @@ _add_trojan_ws_tls() {
                 skip_verify=true
                 _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
             fi
-        fi
-    fi
-
-    # [!] Trojan: 使用密码
-    local password=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        password=$(${SINGBOX_BIN} generate rand --hex 16)
-    else
-        read -p "请输入 Trojan 密码 (回车则随机生成): " input_pw
-        if [ -z "$input_pw" ]; then
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
-            _info "已为您生成随机密码: ${password}"
-        else
-            password="$input_pw"
         fi
     fi
 
@@ -3116,7 +3254,7 @@ _add_trojan_ws_tls() {
                 }
             }')
             
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     _success "Trojan (WebSocket+TLS) 节点 [${name}] 添加成功!"
     _success "客户端连接地址 (server): ${client_server_addr}"
     _success "客户端连接端口 (port): ${client_port}"
@@ -3240,7 +3378,7 @@ _create_anytls_tls_node() {
             "skip-cert-verify": ($skip_verify_bool == "true")
         }')
     
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     
     # --- 保存元数据 ---
     local meta_json
@@ -3264,13 +3402,20 @@ _create_anyreality_node() {
     local server_name="$3"
     local password="$4"
     local name="$5"
+    local private_key="$6"
+    local public_key="$7"
+    local short_id="$8"
     local tag="any-reality-in-${port}"
 
-    local keypair private_key public_key short_id
-    keypair=$(${SINGBOX_BIN} generate reality-keypair)
-    private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-    public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-    short_id=$(${SINGBOX_BIN} generate rand --hex 8)
+    if [ -z "$private_key" ] && [ -z "$public_key" ] && [ -z "$short_id" ]; then
+        _resolve_reality_credentials || return 1
+        private_key="$REALITY_PRIVATE_KEY"
+        public_key="$REALITY_PUBLIC_KEY"
+        short_id="$REALITY_SHORT_ID"
+    fi
+    _validate_credential reality-key "$private_key" || return 1
+    _validate_credential reality-key "$public_key" || return 1
+    _validate_credential short-id "$short_id" || return 1
 
     local inbound_json=$(jq -n \
         --arg t "$tag" \
@@ -3369,11 +3514,16 @@ _add_anytls() {
     fi
 
     local password=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        password=$(${SINGBOX_BIN} generate uuid)
-    else
-        read -p "请输入密码/UUID (回车则随机生成，两种模式共用): " input_pw
-        password=${input_pw:-$(${SINGBOX_BIN} generate uuid)}
+    password=$(_resolve_credential "请输入 AnyTLS 密码/UUID" uuid nonempty true) || return 1
+
+    local reality_private_key=""
+    local reality_public_key=""
+    local reality_short_id=""
+    if [[ "$mode_choice" == *"2"* ]]; then
+        _resolve_reality_credentials || return 1
+        reality_private_key="$REALITY_PRIVATE_KEY"
+        reality_public_key="$REALITY_PUBLIC_KEY"
+        reality_short_id="$REALITY_SHORT_ID"
     fi
 
     local created=false
@@ -3399,7 +3549,7 @@ _add_anytls() {
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
-            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" || return 1
+            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$reality_private_key" "$reality_public_key" "$reality_short_id" || return 1
             created=true
             ;;
         1,2|2,1|"1 2"|"2 1")
@@ -3419,7 +3569,7 @@ _add_anytls() {
                 reality_name=${custom_reality_name:-$default_reality_name}
             fi
             _create_anytls_tls_node "$node_ip" "$tls_port" "$server_name" "$password" "$tls_name" || return 1
-            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" || return 1
+            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" "$reality_private_key" "$reality_public_key" "$reality_short_id" || return 1
             created=true
             ;;
     esac
@@ -3459,11 +3609,12 @@ _add_vless_reality() {
         name=${custom_name:-$default_name}
     fi
 
-    local uuid=$(${SINGBOX_BIN} generate uuid)
-    local keypair=$(${SINGBOX_BIN} generate reality-keypair)
-    local private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-    local public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-    local short_id=$(${SINGBOX_BIN} generate rand --hex 8)
+    local uuid=""
+    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
+    _resolve_reality_credentials || return 1
+    local private_key="$REALITY_PRIVATE_KEY"
+    local public_key="$REALITY_PUBLIC_KEY"
+    local short_id="$REALITY_SHORT_ID"
     local tag="vless-in-${port}"
     # IPv6处理：YAML用原始IP，链接用带[]的IP
     local yaml_ip="$node_ip"
@@ -3476,7 +3627,7 @@ _add_vless_reality() {
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
     _show_node_link "vless-reality" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id"
 }
@@ -3511,7 +3662,8 @@ _add_vless_tcp() {
         name=${custom_name:-$default_name}
     fi
 
-    local uuid=$(${SINGBOX_BIN} generate uuid)
+    local uuid=""
+    uuid=$(_resolve_credential "请输入 VLESS UUID" uuid uuid) || return 1
     local tag="vless-tcp-in-${port}"
     # IPv6处理：YAML用原始IP，链接用带[]的IP
     local yaml_ip="$node_ip"
@@ -3523,7 +3675,7 @@ _add_vless_tcp() {
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":false,"network":"tcp"}')
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     _success "VLESS (TCP) 节点 [${name}] 添加成功!"
     _show_node_link "vless-tcp" "$name" "$link_ip" "$port" "$tag" "$uuid"
 }
@@ -3547,7 +3699,9 @@ _add_hysteria2() {
         server_name="$BATCH_SNI"
         # 批量模式 double check
         [ -z "$node_ip" ] && node_ip="$server_ip"
-        [ "$BATCH_HY2_OBFS" != "none" ] && obfs_password=$(${SINGBOX_BIN} generate rand --hex 16)
+        if [ "$BATCH_HY2_OBFS" != "none" ]; then
+            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty true) || return 1
+        fi
         port_hopping="$BATCH_HY2_HOP"
         if [ -n "$port_hopping" ]; then
             local port_range_start=$(echo $port_hopping | cut -d'-' -f1)
@@ -3591,16 +3745,13 @@ _add_hysteria2() {
     local tag="hy2-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
     local key_path="${SINGBOX_DIR}/${tag}.key"
-    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
 
     local password=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        password=$(${SINGBOX_BIN} generate rand --hex 16)
-    else
-        read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
+    password=$(_resolve_credential "请输入 Hysteria2 密码" "rand-hex:16" nonempty true) || return 1
+    if [ "$BATCH_MODE" != "true" ]; then
         read -p "是否开启 QUIC 流量混淆 (salamander)? (y/N): " h_choice
         if [[ "$h_choice" == "y" ]]; then
-            obfs_password=$(${SINGBOX_BIN} generate rand --hex 16)
+            obfs_password=$(_resolve_credential "请输入 Hysteria2 混淆密码" "rand-hex:16" nonempty true) || return 1
         fi
         read -p "是否开启端口跳跃? (y/N): " hop_choice
         if [[ "$hop_choice" == "y" ]]; then
@@ -3632,9 +3783,14 @@ _add_hysteria2() {
                 fi
                 port_hopping="$port_range"
                 use_multiport="true"
+            else
+                _error "端口跳跃范围格式错误，应为 start-end。"
+                return 1
             fi
         fi
     fi
+
+    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
     
     # [!] 自定义名称
     local name=""
@@ -3716,7 +3872,7 @@ _add_hysteria2() {
             "up": ($up|tonumber),
             "down": ($down|tonumber)
         } | if $op != "" then .obfs = "salamander" | .["obfs-password"] = $op else . end | if $hop != "" then .ports = $hop else . end')
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     
     _success "Hysteria2 节点 [${name}] 添加成功!"
     
@@ -3753,10 +3909,13 @@ _add_tuic() {
     local tag="tuic-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
     local key_path="${SINGBOX_DIR}/${tag}.key"
-    
-    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
 
-    local uuid=$(${SINGBOX_BIN} generate uuid); local password=$(${SINGBOX_BIN} generate rand --hex 16)
+    local uuid=""
+    local password=""
+    uuid=$(_resolve_credential "请输入 TUIC UUID" uuid uuid) || return 1
+    password=$(_resolve_credential "请输入 TUIC 密码" "rand-hex:16" nonempty true) || return 1
+
+    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
     
     # [!] 自主生成与名称分配
     local name=""
@@ -3777,7 +3936,7 @@ _add_tuic() {
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" \
         '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     _success "TUICv5 节点 [${name}] 添加成功!"
     _show_node_link "tuic" "$name" "$link_ip" "$port" "$tag" "$uuid" "$password" "$server_name"
 }
@@ -3791,55 +3950,84 @@ _add_shadowsocks_menu() {
         echo "========================================"
         _info "          添加 Shadowsocks 节点"
         echo "========================================"
-        echo " [经典 SS]"
-        echo " 1) aes-256-gcm"
-        echo " 2) chacha20-ietf-poly1305"
+        echo " [经典 AEAD]"
+        echo " 1) aes-128-gcm"
+        echo " 2) aes-192-gcm"
+        echo " 3) aes-256-gcm"
+        echo " 4) chacha20-ietf-poly1305"
+        echo " 5) xchacha20-ietf-poly1305"
         echo " [SS-2022 (强抗重放保护)]"
-        echo " 3) 2022-blake3-aes-256-gcm"
-        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
-        echo " [SS-2022 + ShadowTLS (完美伪装组合)]"
-        echo " 5) 2022-blake3-aes-256-gcm + ShadowTLS v3"
+        echo " 6) 2022-blake3-aes-128-gcm"
+        echo " 7) 2022-blake3-aes-256-gcm"
+        echo " 8) 2022-blake3-chacha20-poly1305"
+        echo " [增强组合]"
+        echo " 9) 2022-blake3-aes-256-gcm + Multiplex Padding"
+        echo "10) 2022-blake3-aes-256-gcm + ShadowTLS v3"
+        echo " [测试用途]"
+        echo "11) none (不加密，不推荐)"
         echo " 0) 返回"
         echo "========================================"
-        read -p "请选择加密方式 [0-5]: " choice
+        read -r -p "请选择加密方式 [0-11]: " choice
     fi
 
     local method="" password="" name_prefix="" use_multiplex=false use_shadowtls=false
+    local password_generator="rand-hex:16"
+    local password_validator="nonempty"
     case $choice in
-        1) 
-            method="aes-256-gcm"
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
-            name_prefix="SS-aes256"
-            ;;
-        2) 
+        1) method="aes-128-gcm"; name_prefix="SS-aes128" ;;
+        2) method="aes-192-gcm"; name_prefix="SS-aes192" ;;
+        3) method="aes-256-gcm"; name_prefix="SS-aes256" ;;
+        4)
             method="chacha20-ietf-poly1305"
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
             name_prefix="SS-chacha20"
             ;;
-        3)
-            method="2022-blake3-aes-256-gcm"
-            # SS-2022 的 aes-256 需要严格的 32 字节 (256位) base64 密钥
-            password=$(${SINGBOX_BIN} generate rand --base64 32)
-            name_prefix="SS-2022"
+        5) method="xchacha20-ietf-poly1305"; name_prefix="SS-xchacha20" ;;
+        6)
+            method="2022-blake3-aes-128-gcm"
+            name_prefix="SS-2022-AES128"
+            password_generator="rand-base64:16"
+            password_validator="base64-bytes:16"
             ;;
-        4)
+        7)
             method="2022-blake3-aes-256-gcm"
-            password=$(${SINGBOX_BIN} generate rand --base64 32)
+            name_prefix="SS-2022-AES256"
+            password_generator="rand-base64:32"
+            password_validator="base64-bytes:32"
+            ;;
+        8)
+            method="2022-blake3-chacha20-poly1305"
+            name_prefix="SS-2022-Chacha20"
+            password_generator="rand-base64:32"
+            password_validator="base64-bytes:32"
+            ;;
+        9)
+            method="2022-blake3-aes-256-gcm"
             name_prefix="SS-2022-Padding"
+            password_generator="rand-base64:32"
+            password_validator="base64-bytes:32"
             use_multiplex=true
             _info "已启用 Multiplex + Padding 模式"
             _warning "注意：客户端也必须启用 Multiplex + Padding 才能连接！"
             ;;
-        5)
-            # SS-2022 256 位版本（抗重放增强）
+        10)
             method="2022-blake3-aes-256-gcm"
-            password=$(${SINGBOX_BIN} generate rand --base64 32)
             name_prefix="SS-ShadowTLS"
+            password_generator="rand-base64:32"
+            password_validator="base64-bytes:32"
             use_shadowtls=true
+            ;;
+        11)
+            method="none"
+            name_prefix="SS-none"
+            _warning "none 模式不提供加密，仅建议在受信任网络中测试使用。"
             ;;
         0) return 1 ;;
         *) _error "无效输入"; return 1 ;;
     esac
+
+    if [ "$method" != "none" ]; then
+        password=$(_resolve_credential "请输入 Shadowsocks 密码/密钥" "$password_generator" "$password_validator" true) || return 1
+    fi
 
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
@@ -3847,9 +4035,15 @@ _add_shadowsocks_menu() {
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
+        while true; do
+            read -r -p "请输入监听端口: " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]] && _error "端口应为 1-65535。" && continue
+            { _check_port_conflict "$port" tcp || _check_port_conflict "$port" udp; } && continue
+            break
+        done
     fi
     
     # [!] 新增：自定义名称
@@ -3865,9 +4059,13 @@ _add_shadowsocks_menu() {
     local shadowtls_password=""
     local shadowtls_sni="www.amd.com"
     if [ "$use_shadowtls" == "true" ]; then
-        shadowtls_password=$(${SINGBOX_BIN} generate rand --hex 16)
-        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.amd.com): " custom_sni
-        shadowtls_sni=${custom_sni:-www.amd.com}
+        shadowtls_password=$(_resolve_credential "请输入 ShadowTLS 密码" "rand-hex:16" nonempty true) || return 1
+        if [ "$BATCH_MODE" = "true" ]; then
+            shadowtls_sni="${BATCH_SNI:-www.amd.com}"
+        else
+            read -r -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.amd.com): " custom_sni
+            shadowtls_sni=${custom_sni:-www.amd.com}
+        fi
     fi
 
     local tag="${name_prefix}-in-${port}"
@@ -3981,7 +4179,7 @@ _add_shadowsocks_menu() {
                 "password": $pw
             }')
     fi
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
 
     _success "Shadowsocks (${method}) 节点 [${name}] 添加成功!"
     if [ "$use_multiplex" == "true" ]; then
@@ -4008,8 +4206,6 @@ _add_socks() {
             _error "批量创建错误: BATCH_PORT 为空，跳过 SOCKS5 安装。"
             return 1
         fi
-        username=$(${SINGBOX_BIN} generate rand --hex 8)
-        password=$(${SINGBOX_BIN} generate rand --hex 16)
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
@@ -4019,9 +4215,9 @@ _add_socks() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        read -p "请输入用户名 (默认随机): " username; username=${username:-$(${SINGBOX_BIN} generate rand --hex 8)}
-        read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
     fi
+    username=$(_resolve_credential "请输入 SOCKS5 用户名" "rand-hex:8" nonempty) || return 1
+    password=$(_resolve_credential "请输入 SOCKS5 密码" "rand-hex:16" nonempty true) || return 1
     local tag="socks-in-${port}"
     local name="Batch-SOCKS5-${port}"
     [ "$BATCH_MODE" != "true" ] && name="SOCKS5-${port}"
@@ -4033,7 +4229,7 @@ _add_socks() {
 
     local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg u "$username" --arg pw "$password" \
         '{"name":$n,"type":"socks5","server":$s,"port":($p|tonumber),"username":$u,"password":$pw}')
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     _success "SOCKS5 节点添加成功!"
     _show_node_link "socks" "$name" "$display_ip" "$port" "$tag" "$username" "$password"
 }
@@ -5697,15 +5893,19 @@ _batch_create_nodes() {
     [ -z "$input_str" ] && return 1
 
     # 1. 解析协议列表
-    local proto_ids=$(echo "$input_str" | tr ',' ' ' | xargs)
+    local proto_ids=""
+    proto_ids=$(echo "$input_str" | tr ',' ' ' | xargs)
+    local proto_array=()
+    read -r -a proto_array <<< "$proto_ids"
     local proto_count=0
-    local has_complex=false 
     local has_sni_req=false 
     local has_hy2=false     
     local has_ss=false      
+    local has_reality=false
     local ss_occurences=0
 
-    for pid in $proto_ids; do
+    local pid=""
+    for pid in "${proto_array[@]}"; do
         if [[ ! "$pid" =~ ^(1|2|3|4|5|6|7|8|9|10)$ ]]; then
             _error "协议 ID $pid 无效，请输入 1-10 范围内的协议编号。"
             return 1
@@ -5719,9 +5919,9 @@ _batch_create_nodes() {
             has_ss=true
             ((ss_occurences++))
         fi
-        [[ "$pid" =~ ^(6|8)$ ]] && has_complex=true
-        [[ "$pid" =~ ^(1|4|5|6|7)$ ]] && has_sni_req=true
+        [[ "$pid" =~ ^(1|4|5|6|7|8)$ ]] && has_sni_req=true
         [[ "$pid" == "6" ]] && has_hy2=true
+        [[ "$pid" == "1" ]] && has_reality=true
     done
 
     [ $proto_count -eq 0 ] && { _error "未选择任何协议"; return 1; }
@@ -5744,33 +5944,68 @@ _batch_create_nodes() {
         [ -n "$input_sni" ] && BATCH_SNI="$input_sni"
     fi
 
-    # 2.2 Hy2 专项
+    # 2.2 Reality 专项：全留空时不导出，让每个批量节点独立随机生成。
+    if [ "$has_reality" = true ]; then
+        _info "可输入批量 Reality 共用凭据；全部留空时每个节点使用独立随机密钥。"
+        _resolve_reality_credentials || return 1
+        if [ "$REALITY_INPUT_PROVIDED" = "true" ]; then
+            export BATCH_REALITY_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+            export BATCH_REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY"
+            export BATCH_REALITY_SHORT_ID="$REALITY_SHORT_ID"
+        else
+            unset BATCH_REALITY_PRIVATE_KEY BATCH_REALITY_PUBLIC_KEY BATCH_REALITY_SHORT_ID
+        fi
+    fi
+
+    # 2.3 Hy2 专项
     local hy2_obfs="none"
-    local hy2_hop="false"
     local hy2_hop_range=""
     if [ "$has_hy2" = true ]; then
         read -p "是否开启 Hysteria2 QUIC 混淆? (y/N): " hy2_q_choice
         [[ "$hy2_q_choice" == "y" ]] && hy2_obfs="salamander"
         read -p "是否开启 Hysteria2 端口跳跃? (y/N): " hy2_h_choice
         if [[ "$hy2_h_choice" == "y" ]]; then
-            hy2_hop="true"
             read -p "请输入端口跳跃范围 (如 20000-30000): " hy2_hop_range
         fi
     fi
 
     # 2.4 SS 专项 (支持多选)
-    local ss_variant="1"
+    local ss_variant="3"
     if [ "$has_ss" = true ]; then
-        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,2,3,4):"
-        echo " 1) aes-256-gcm"
-        echo " 2) chacha20-ietf-poly1305"
-        echo " 3) 2022-blake3-aes-256-gcm"
-        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
-        read -p "选择 [1-4] (默认1): " ss_choice
-        ss_variant=${ss_choice:-1}
+        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,4,7):"
+        echo " 1) aes-128-gcm"
+        echo " 2) aes-192-gcm"
+        echo " 3) aes-256-gcm"
+        echo " 4) chacha20-ietf-poly1305"
+        echo " 5) xchacha20-ietf-poly1305"
+        echo " 6) 2022-blake3-aes-128-gcm"
+        echo " 7) 2022-blake3-aes-256-gcm"
+        echo " 8) 2022-blake3-chacha20-poly1305"
+        echo " 9) 2022-blake3-aes-256-gcm + Padding"
+        echo "10) 2022-blake3-aes-256-gcm + ShadowTLS v3"
+        echo "11) none (不加密，不推荐)"
+        read -r -p "选择 [1-11] (默认3): " ss_choice
+        ss_variant=$(echo "${ss_choice:-3}" | tr ',' ' ' | xargs)
+
+        local ss_variants=()
+        read -r -a ss_variants <<< "$ss_variant"
+        local seen_ss_variants=" "
+        local ss_item=""
+        for ss_item in "${ss_variants[@]}"; do
+            if [[ ! "$ss_item" =~ ^([1-9]|10|11)$ ]]; then
+                _error "Shadowsocks 加密方式编号 ${ss_item} 无效。"
+                return 1
+            fi
+            if [[ "$seen_ss_variants" == *" $ss_item "* ]]; then
+                _error "Shadowsocks 加密方式编号 ${ss_item} 重复。"
+                return 1
+            fi
+            seen_ss_variants="${seen_ss_variants}${ss_item} "
+        done
+
         # 计算 SS 实际需要的端口数
-        local ss_needed=$(echo "$ss_variant" | tr ',' ' ' | wc -w)
-        # 每个 Shadowsocks ID (7) 额外需要 (ss_needed - 1) 个端口
+        local ss_needed="${#ss_variants[@]}"
+        # 每个 Shadowsocks ID (8) 额外需要 (ss_needed - 1) 个端口
         proto_count=$((proto_count + (ss_needed - 1) * ss_occurences))
     fi
 
@@ -5786,19 +6021,23 @@ _batch_create_nodes() {
         local seen_ports=" "
         p_input=$(echo "$p_input" | tr ',' ' ' | xargs)
         [ -z "$p_input" ] && { _error "端口不能为空，请重新输入。"; continue; }
+        local p=""
         if [[ "$p_input" == *"-"* ]]; then
-            local start_p=$(echo $p_input | cut -d'-' -f1)
-            local end_p=$(echo $p_input | cut -d'-' -f2)
-            if [[ ! "$start_p" =~ ^[0-9]+$ ]] || [[ ! "$end_p" =~ ^[0-9]+$ ]] || [ "$start_p" -lt 1 ] || [ "$end_p" -gt 65535 ] || [ "$start_p" -gt "$end_p" ]; then
+            if [[ ! "$p_input" =~ ^([0-9]+)-([0-9]+)$ ]]; then
                 _error "端口范围无效，应为 1-65535 内的 start-end。"
                 continue
             fi
-            for ((p=start_p; p<=end_p; p++)); do current_p_list+=($p); done
+            local start_p="${BASH_REMATCH[1]}"
+            local end_p="${BASH_REMATCH[2]}"
+            if [ "$start_p" -lt 1 ] || [ "$end_p" -gt 65535 ] || [ "$start_p" -gt "$end_p" ]; then
+                _error "端口范围无效，应为 1-65535 内的 start-end。"
+                continue
+            fi
+            for ((p=start_p; p<=end_p; p++)); do current_p_list+=("$p"); done
         else
-            current_p_list=($p_input)
+            read -r -a current_p_list <<< "$p_input"
         fi
 
-        local p
         for p in "${current_p_list[@]}"; do
             if [[ ! "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
                 _error "端口 ${p} 无效，应为 1-65535。"
@@ -5811,7 +6050,7 @@ _batch_create_nodes() {
                 break
             fi
             seen_ports="${seen_ports}${p} "
-            if _check_port_conflict "$p" "tcp" "true"; then
+            if _check_port_conflict "$p" "tcp" "true" || _check_port_conflict "$p" "udp" "true"; then
                 _error "端口 ${p} 已被占用，请重新输入。"
                 occupied_port=true
                 break
@@ -5821,7 +6060,7 @@ _batch_create_nodes() {
             continue
         fi
         
-        if [ ${#current_p_list[@]} -lt $proto_count ]; then
+        if [ "${#current_p_list[@]}" -lt "$proto_count" ]; then
             _error "输入端口数量不足（仅 ${#current_p_list[@]} 个），请重新输入。"
         else
             ports_list=("${current_p_list[@]}")
@@ -5831,19 +6070,26 @@ _batch_create_nodes() {
 
     # 4. 执行安装循环
     local bulk_idx=0
-    local proto_array=($proto_ids)
+    local batch_success=0
+    local batch_failed=0
     for i in "${!proto_array[@]}"; do
-        local pid=${proto_array[$i]}
+        pid="${proto_array[$i]}"
         
         if [ "$pid" == "8" ]; then
-            local ss_variants=$(echo "$ss_variant" | tr ',' ' ')
-            for v in $ss_variants; do
+            local batch_ss_variants=()
+            read -r -a batch_ss_variants <<< "$ss_variant"
+            local v=""
+            for v in "${batch_ss_variants[@]}"; do
                 local current_port=${ports_list[$bulk_idx]}
                 _info "正在安装 Shadowsocks (变体 $v) 到端口 $current_port..."
                 export BATCH_MODE="true"
                 export BATCH_PORT="$current_port"
                 export BATCH_SS_VARIANT="$v"
-                _add_shadowsocks_menu
+                if _add_shadowsocks_menu; then
+                    ((batch_success++))
+                else
+                    ((batch_failed++))
+                fi
                 ((bulk_idx++))
             done
         else
@@ -5855,6 +6101,7 @@ _batch_create_nodes() {
             export BATCH_HY2_OBFS="$hy2_obfs"
             export BATCH_HY2_HOP="$hy2_hop_range"
 
+            local create_result=0
             case $pid in
                 1) _add_vless_reality ;;
                 2) _add_vless_ws_tls ;;
@@ -5866,20 +6113,30 @@ _batch_create_nodes() {
                 9) _add_vless_tcp ;;
                 10) _add_socks ;;
             esac
+            create_result=$?
+            if [ "$create_result" -eq 0 ]; then
+                ((batch_success++))
+            else
+                ((batch_failed++))
+            fi
             ((bulk_idx++))
         fi
     done
 
     unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
+    unset BATCH_REALITY_PRIVATE_KEY BATCH_REALITY_PUBLIC_KEY BATCH_REALITY_SHORT_ID
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
-    _success "所有节点已按直连模式部署完毕。"
-    _info "所有批量节点已就绪，您可以运行 sb 查看具体配置。"
+    _success "成功创建 ${batch_success} 个节点。"
+    [ "$batch_failed" -gt 0 ] && _error "有 ${batch_failed} 个节点创建失败，请根据上方错误检查配置。"
+    _info "已创建的批量节点可以通过 sb 查看具体配置。"
     echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
 
-    _success "批量创建任务已全部完成。"
-    _manage_service restart
+    if [ "$batch_success" -gt 0 ]; then
+        _manage_service restart
+    fi
+    [ "$batch_failed" -eq 0 ]
 }
 
 _show_add_node_menu() {
@@ -6034,21 +6291,23 @@ main() {
     _main_menu
 }
 
-# 解析命令行参数
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        keepalive)
-            _argo_keepalive
-            exit 0
-            ;;
-        cleanup-logs)
-            _cleanup_runtime_logs
-            exit $?
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # 解析命令行参数
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            keepalive)
+                _argo_keepalive
+                exit 0
+                ;;
+            cleanup-logs)
+                _cleanup_runtime_logs
+                exit $?
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
 
-main
+    main
+fi
