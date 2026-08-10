@@ -84,15 +84,21 @@ update_function=$(declare -f _update_script)
 [[ "$update_function" == *'mkdir -p "$target_parent"'* ]] || fail 'missing sub-script install locations are not created during updates'
 [[ "$update_function" == *'cmp -s "$temp_sub_path" "$script_path"'* ]] || fail 'updated sub-script copies are not verified'
 [[ "$update_function" == *'if [ "$component_update_failed" = true ]'* ]] || fail 'partial sub-script update failures are still reported as full success'
-assert_eq '25' "$SCRIPT_VERSION" 'main script version after AnyTLS padding repair'
+assert_eq '26' "$SCRIPT_VERSION" 'main script version after menu input buffer repair'
 
 normalized_menu_choice=''
 _normalize_numeric_menu_choice normalized_menu_choice $' \t15\r '
 assert_eq '15' "$normalized_menu_choice" 'menu choice CR and whitespace normalization'
 _normalize_numeric_menu_choice normalized_menu_choice $'\e[200~15\e[201~'
 assert_eq '15' "$normalized_menu_choice" 'menu choice bracketed-paste normalization'
+_normalize_numeric_menu_choice normalized_menu_choice $'\e[?2004h0\r\177\e[?2004l'
+assert_eq '0' "$normalized_menu_choice" 'menu choice generic terminal control normalization'
 main_menu_function=$(declare -f _main_menu)
 [[ "$main_menu_function" == *'_normalize_numeric_menu_choice choice "$choice"'* ]] || fail 'main menu does not normalize terminal input before dispatch'
+[[ "$main_menu_function" == *'_wait_for_enter "按回车键返回主菜单..."'* ]] || fail 'main menu still leaves partial key sequences in the input buffer'
+if grep -Eq 'read[[:space:]]+-n[[:space:]]+1|按任意键' "${REPO_ROOT}/singbox.sh"; then
+    fail 'single-byte wait prompts still leave input bytes for a later menu read'
+fi
 
 update_test_root="${TEST_TMP}/script-update"
 update_script_dir="${update_test_root}/bin"

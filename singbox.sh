@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="25"
+export SCRIPT_VERSION="26"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -1225,7 +1225,7 @@ _add_argo_node() {
         _info "  Public Hostname: ${tunnel_domain}"
         _info "  Service: http://localhost:${port}"
         echo ""
-        read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
+        _wait_for_enter "确认配置无误后，按回车键继续..."
         echo ""
     else
         _info "您选择了 [临时隧道] 模式。"
@@ -2023,7 +2023,7 @@ _argo_menu() {
             *) _error "无效选项" ;;
         esac
         echo ""
-        read -n 1 -s -r -p "按任意键继续..."
+        _wait_for_enter
     done
 }
 
@@ -4912,7 +4912,7 @@ _dns_config_menu() {
                 [ -z "$dns_address" ] && continue
                 if [[ "$dns_address" =~ [[:space:]] ]]; then
                     _error "DNS 地址不能包含空白字符。"
-                    read -n 1 -s -r -p "按任意键继续..."
+                    _wait_for_enter
                     continue
                 fi
                 ;;
@@ -4928,7 +4928,7 @@ _dns_config_menu() {
                     2) dns_strategy="prefer_ipv6" ;;
                     3) dns_strategy="ipv4_only" ;;
                     4) dns_strategy="ipv6_only" ;;
-                    *) _error "无效输入。"; read -n 1 -s -r -p "按任意键继续..."; continue ;;
+                    *) _error "无效输入。"; _wait_for_enter; continue ;;
                 esac
                 dns_address="$current_address"
                 if [ "$dns_address" = "未设置" ]; then
@@ -4939,11 +4939,11 @@ _dns_config_menu() {
                 echo ""
                 jq '.dns' "$CONFIG_FILE" 2>/dev/null || _error "无法读取 DNS 配置。"
                 echo ""
-                read -n 1 -s -r -p "按任意键继续..."
+                _wait_for_enter
                 continue
                 ;;
             0) return ;;
-            *) _error "无效输入，请重试。"; read -n 1 -s -r -p "按任意键继续..."; continue ;;
+            *) _error "无效输入，请重试。"; _wait_for_enter; continue ;;
         esac
 
         echo ""
@@ -4954,7 +4954,7 @@ _dns_config_menu() {
         fi
         _apply_dns_config "$dns_address" "$dns_strategy"
         echo ""
-        read -n 1 -s -r -p "按任意键继续..."
+        _wait_for_enter
     done
 }
 
@@ -5700,7 +5700,18 @@ _xray_features() {
     fi
 }
 
-# 规范化数字菜单输入，兼容 CR 和终端 bracketed-paste 控制序列。
+# 等待用户按回车并消费整行输入，避免残留字节污染下一个菜单。
+# 参数：
+#   $1 - 可选的提示文本；为空时使用默认提示。
+# 输出：读取并丢弃一整行输入。
+_wait_for_enter() {
+    local prompt_text="${1:-按回车键继续...}"
+    local ignored_input=""
+
+    IFS= read -r -p "$prompt_text" ignored_input
+}
+
+# 规范化数字菜单输入，兼容控制字符和终端 bracketed-paste 控制序列。
 # 参数：
 #   $1 - 接收规范化结果的变量名。
 #   $2 - read 读取到的原始菜单输入。
@@ -5708,11 +5719,15 @@ _xray_features() {
 _normalize_numeric_menu_choice() {
     local output_var="$1"
     local raw_choice="$2"
+    local csi_pattern=$'\e''\[[0-9;?]*[ -/]*[@-~]'
 
     [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    while [[ "$raw_choice" =~ $csi_pattern ]]; do
+        raw_choice=${raw_choice/"${BASH_REMATCH[0]}"/}
+    done
     raw_choice=${raw_choice//$'\e[200~'/}
     raw_choice=${raw_choice//$'\e[201~'/}
-    raw_choice=${raw_choice//$'\r'/}
+    raw_choice=$(printf '%s' "$raw_choice" | LC_ALL=C tr -d '\001-\037\177')
     while [[ "$raw_choice" == [[:space:]]* ]]; do
         raw_choice="${raw_choice#?}"
     done
@@ -5905,7 +5920,7 @@ _main_menu() {
             *) _error "无效输入，请重试。" ;;
         esac
         echo
-        read -n 1 -s -r -p "按任意键返回主菜单..."
+        _wait_for_enter "按回车键返回主菜单..."
     done
 }
 
@@ -5923,7 +5938,7 @@ _main_menu() {
         # 仅简单的环境预判
         if [ "$INIT_SYSTEM" == "direct" ]; then
             _error "未能识别系统初始化环境 (systemd/openrc)，定时重启功能暂不可用。"
-            read -n 1 -s -r -p "按任意键返回..."
+            _wait_for_enter "按回车键返回..."
             return
         fi
 
@@ -6137,7 +6152,7 @@ EOF
     esac
     
     echo ""
-    read -n 1 -s -r -p "按任意键继续..."
+    _wait_for_enter
 }
 
 # 批量创建节点 (v11.3 深度向导版)
