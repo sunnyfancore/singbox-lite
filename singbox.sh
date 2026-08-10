@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="22"
+export SCRIPT_VERSION="23"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5223,6 +5223,8 @@ _update_script() {
     local cache_bust
     local main_script_url
     local downloaded_version
+    local installed_version
+    local component_update_failed=false
     cache_bust=$(date +%s)
     main_script_url="${SCRIPT_UPDATE_URL}?v=${cache_bust}"
     
@@ -5245,8 +5247,16 @@ _update_script() {
             return 1
         fi
         
-        chmod +x "$temp_script_path"
-        mv "$temp_script_path" "$SELF_SCRIPT_PATH"
+        if ! chmod +x "$temp_script_path" || ! mv "$temp_script_path" "$SELF_SCRIPT_PATH"; then
+            _error "主脚本写入失败: ${SELF_SCRIPT_PATH}"
+            rm -f "$temp_script_path"
+            return 1
+        fi
+        installed_version=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$SELF_SCRIPT_PATH" | head -n 1)
+        if [ "$installed_version" != "$downloaded_version" ]; then
+            _error "主脚本写入后版本校验失败，期望 v${downloaded_version}，实际 v${installed_version:-未知}。"
+            return 1
+        fi
         _success "主脚本更新成功：v${SCRIPT_VERSION} -> v${downloaded_version}"
     else
         _error "主脚本下载失败！请检查网络或 GitHub 链接。"
@@ -5267,26 +5277,37 @@ _update_script() {
         local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
         local temp_sub_path="${SELF_SCRIPT_PATH}.${script_name}.tmp"
 
-        # 路径顺序与启动逻辑一致；两个副本同时存在时全部更新，避免运行旧副本。
+        # 路径顺序与启动逻辑一致；主动创建并更新两个位置，避免旧副本继续被优先执行。
         paths_to_check+=("$active_script_path")
         [ "$fallback_script_path" != "$active_script_path" ] && paths_to_check+=("$fallback_script_path")
         for script_path in "${paths_to_check[@]}"; do
-            [ -f "$script_path" ] && installed_paths+=("$script_path")
+            local target_parent
+            target_parent=$(dirname "$script_path")
+            if mkdir -p "$target_parent" 2>/dev/null; then
+                installed_paths+=("$script_path")
+            else
+                update_failed=true
+                component_update_failed=true
+                _warning "无法创建子脚本目录: ${target_parent}"
+            fi
         done
 
         if [ "${#installed_paths[@]}" -eq 0 ]; then
-            _warning "子脚本 ${script_name} 未安装，跳过更新。"
+            component_update_failed=true
+            _warning "子脚本 ${script_name} 没有可写入的安装位置。"
             continue
         fi
 
         _info "正在下载并校验子脚本: ${script_name}..."
         if ! wget -qO "$temp_sub_path" "$script_url"; then
+            component_update_failed=true
             _warning "子脚本 ${script_name} 下载失败，保留现有文件。"
             rm -f "$temp_sub_path"
             continue
         fi
         if [ ! -s "$temp_sub_path" ] || ! head -n 1 "$temp_sub_path" | grep -Eq '^#!.*bash' || \
            ! bash -n "$temp_sub_path" 2>/dev/null; then
+            component_update_failed=true
             _warning "子脚本 ${script_name} 内容或 Bash 语法无效，已拒绝覆盖。"
             rm -f "$temp_sub_path"
             continue
@@ -5295,21 +5316,25 @@ _update_script() {
         for script_path in "${installed_paths[@]}"; do
             local target_temp_path="${script_path}.tmp"
             _info "正在更新子脚本: ${script_name} -> ${script_path}..."
-            if cp "$temp_sub_path" "$target_temp_path" && chmod +x "$target_temp_path" && mv "$target_temp_path" "$script_path"; then
+            if cp "$temp_sub_path" "$target_temp_path" && chmod +x "$target_temp_path" && \
+               mv "$target_temp_path" "$script_path" && cmp -s "$temp_sub_path" "$script_path"; then
                 updated=true
+                _success "子脚本写入并校验成功: ${script_path}"
             else
                 update_failed=true
-                _warning "子脚本写入失败: ${script_path}"
+                component_update_failed=true
+                _warning "子脚本写入或校验失败: ${script_path}"
                 rm -f "$target_temp_path"
             fi
         done
         rm -f "$temp_sub_path"
 
         if [ "$updated" = true ] && [ "$update_failed" = false ]; then
-            _success "子脚本 (${script_name}) 的全部已安装副本更新成功。"
+            _success "子脚本 (${script_name}) 的全部运行位置更新成功。"
         elif [ "$updated" = true ]; then
             _warning "子脚本 ${script_name} 仅部分副本更新成功，请检查上方失败路径。"
         else
+            component_update_failed=true
             _warning "子脚本 ${script_name} 更新失败，已保留原文件。"
         fi
     done
@@ -5317,7 +5342,13 @@ _update_script() {
     # 更新 yq 工具（如果缺失或版本过旧）
     _install_yq
     
-    _success "所有脚本组件已更新至最新版 (v${downloaded_version})！"
+    if [ "$component_update_failed" = true ]; then
+        _error "主脚本已更新，但部分子脚本更新失败，不能视为全部更新成功。"
+        _info "请根据上方路径处理权限或网络问题后，再次运行菜单 13。"
+        return 1
+    fi
+
+    _success "所有脚本组件均已写入并校验完成 (v${downloaded_version})！"
     _info "请重新运行脚本以应用所有变更："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
     exit 0

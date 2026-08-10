@@ -81,6 +81,49 @@ update_function=$(declare -f _update_script)
 [[ "$update_function" == *'paths_to_check+=("$active_script_path")'* ]] || fail 'sub-script update order does not match launch order'
 [[ "$update_function" == *'for script_path in "${installed_paths[@]}"'* ]] || fail 'all installed sub-script copies are not updated'
 [[ "$update_function" == *'! bash -n "$temp_sub_path"'* ]] || fail 'downloaded sub-scripts are not syntax checked'
+[[ "$update_function" == *'mkdir -p "$target_parent"'* ]] || fail 'missing sub-script install locations are not created during updates'
+[[ "$update_function" == *'cmp -s "$temp_sub_path" "$script_path"'* ]] || fail 'updated sub-script copies are not verified'
+[[ "$update_function" == *'if [ "$component_update_failed" = true ]'* ]] || fail 'partial sub-script update failures are still reported as full success'
+assert_eq '23' "$SCRIPT_VERSION" 'main script version after updater repair'
+
+update_test_root="${TEST_TMP}/script-update"
+update_script_dir="${update_test_root}/bin"
+update_config_dir="${update_test_root}/etc"
+mkdir -p "$update_script_dir" "$update_config_dir"
+cp "${REPO_ROOT}/singbox.sh" "${update_script_dir}/singbox.sh"
+(
+    SELF_SCRIPT_PATH="${update_script_dir}/singbox.sh"
+    SCRIPT_DIR="$update_script_dir"
+    SINGBOX_DIR="$update_config_dir"
+    SCRIPT_UPDATE_URL="https://example.test/singbox.sh"
+    GITHUB_RAW_BASE="https://example.test"
+
+    # 模拟 wget，将更新地址映射到当前仓库中的同名文件。
+    # 参数：
+    #   $1 - wget 的 -qO 参数。
+    #   $2 - 下载目标路径。
+    #   $3 - 带可选查询参数的下载地址。
+    # 输出：复制成功时返回 0，否则返回 1。
+    wget() {
+        local destination="$2"
+        local source_url="${3%%\?*}"
+        local source_name="${source_url##*/}"
+        cp "${REPO_ROOT}/${source_name}" "$destination"
+    }
+
+    # 更新器测试不需要安装真实 yq。
+    # 参数：无。
+    # 输出：始终返回成功。
+    _install_yq() {
+        return 0
+    }
+
+    _update_script
+) >/dev/null 2>&1
+for updated_sub_script in advanced_relay.sh parser.sh xray_manager.sh; do
+    cmp -s "${REPO_ROOT}/${updated_sub_script}" "${update_script_dir}/${updated_sub_script}" || fail "active sub-script copy was not updated: ${updated_sub_script}"
+    cmp -s "${REPO_ROOT}/${updated_sub_script}" "${update_config_dir}/${updated_sub_script}" || fail "fallback sub-script copy was not updated: ${updated_sub_script}"
+done
 
 uninstall_function=$(declare -f _uninstall)
 [[ "$uninstall_function" == *'/etc/systemd/system/sing-box.service'* ]] || fail 'uninstall misses the sing-box systemd service'
