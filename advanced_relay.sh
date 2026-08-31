@@ -2342,6 +2342,7 @@ _clear_all_relays() {
     local config_backup="${RELAY_CONFIG_FILE}.clear-all.bak"
     local links_backup="${links_file}.clear-all.bak"
     local main_backup="${MAIN_CONFIG_FILE}.clear-relay-users.bak"
+    local config_temp="${RELAY_CONFIG_FILE}.clear-all.tmp"
     local cleanup_failed="false"
 
     [ -f "$RELAY_CONFIG_FILE" ] || printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
@@ -2362,37 +2363,89 @@ _clear_all_relays() {
         return 1
     fi
 
+    # 逐条移除中转路由，沿用单条删除逻辑以保留端口转发等其他 relay.json 内容。
+    while IFS=$'\t' read -r inbound_tag outbound_tag rule_auth_user; do
+        [ -n "$inbound_tag" ] && [ -n "$outbound_tag" ] || continue
+
+        local route_metadata=""
+        local source_config="relay"
+        local metadata_auth_user=""
+        route_metadata=$(_relay_get_route_metadata "$inbound_tag" "$outbound_tag") || route_metadata=""
+        [ -n "$route_metadata" ] || route_metadata='{}'
+        source_config=$(printf '%s' "$route_metadata" | jq -r '.source_config // "relay"' 2>/dev/null) || source_config="relay"
+        metadata_auth_user=$(printf '%s' "$route_metadata" | jq -r '.auth_user // empty' 2>/dev/null) || metadata_auth_user=""
+        [ -n "$metadata_auth_user" ] || metadata_auth_user="$rule_auth_user"
+
+        if ! _relay_remove_route_config "$RELAY_CONFIG_FILE" "$inbound_tag" "$outbound_tag" "$metadata_auth_user"; then
+            cleanup_failed="true"
+            break
+        fi
+        if [ "$source_config" == "main" ] && [ -f "$MAIN_CONFIG_FILE" ] &&
+           ! _relay_remove_external_auth_user "$MAIN_CONFIG_FILE" "$inbound_tag" "$metadata_auth_user"; then
+            cleanup_failed="true"
+            break
+        fi
+    done < <(jq -r '
+        .route.rules[]?
+        | select((.outbound // "") | startswith("relay-out-"))
+        | [(.inbound // ""), (.outbound // ""),
+           (if (.auth_user | type) == "array" then (.auth_user[0] // "") else (.auth_user // "") end)]
+        | @tsv
+    ' "$config_backup" 2>/dev/null)
+
+    if [ "$cleanup_failed" == "true" ]; then
+        rm -f "$config_temp"
+        _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
+        _error "批量删除中转路由失败，已恢复原配置。"
+        return 1
+    fi
+
+    # 清理没有对应活动路由的中转出口/路由，但保留端口转发和其他非中转配置。
+    if ! jq '
+        .outbounds = [.outbounds[]? | select(((.tag // "") | startswith("relay-out-")) | not)]
+        | .route = (.route // {})
+        | .route.rules = [.route.rules[]? | select((((.outbound // "") | startswith("relay-out-"))) | not)]
+    ' "$RELAY_CONFIG_FILE" > "$config_temp" || ! mv "$config_temp" "$RELAY_CONFIG_FILE"; then
+        rm -f "$config_temp"
+        _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
+        _error "清理中转出口失败，已恢复原配置。"
+        return 1
+    fi
+
+    # 主节点复用入口可能由脚本创建了直连基线规则；所有中转路由删除后同步移除该基线。
     if [ -f "$MAIN_CONFIG_FILE" ]; then
-        while IFS=$'\t' read -r inbound_tag auth_user; do
-            [ -n "$inbound_tag" ] && [ -n "$auth_user" ] || continue
-            if ! _relay_remove_external_auth_user "$MAIN_CONFIG_FILE" "$inbound_tag" "$auth_user"; then
-                cleanup_failed="true"
-                break
+        while IFS=$'\t' read -r inbound_tag base_route_owned; do
+            base_route_owned="${base_route_owned//$'\r'/}"
+            [ "$base_route_owned" == "true" ] || continue
+            [ -n "$inbound_tag" ] || continue
+            if ! _relay_remove_external_base_route "$RELAY_CONFIG_FILE" "$inbound_tag"; then
+                _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
+                [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
+                _error "清理主节点直连基线失败，已恢复原配置。"
+                return 1
             fi
         done < <(jq -r '
             to_entries[]?
             | select((.value | type) == "object")
             | select((.value.source_config // "relay") == "main")
-            | [(.value.inbound_tag // ""), (.value.auth_user // "")] | @tsv
-        ' "$links_backup" 2>/dev/null)
+            | select((.value.base_route_owned // false) == true)
+            | [(.value.inbound_tag // ""), (.value.base_route_owned // false)]
+            | @tsv
+        ' "$links_backup" 2>/dev/null | sort -u)
     fi
 
-    if [ "$cleanup_failed" == "true" ]; then
-        _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
-        [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
-        _error "清理主节点附加认证用户失败，已恢复原配置。"
-        return 1
-    fi
-
-    printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
     printf '%s\n' '{}' > "$links_file"
     if ! _relay_check_combined_config "$RELAY_CONFIG_FILE"; then
+        rm -f "$config_temp"
         _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
         [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
         _error "清空后的配置检查失败，已恢复原配置。"
         return 1
     fi
     if ! _manage_service restart; then
+        rm -f "$config_temp"
         _relay_restore_auth_route_files "$RELAY_CONFIG_FILE" "$config_backup" "$links_file" "$links_backup"
         [ -f "$main_backup" ] && mv "$main_backup" "$MAIN_CONFIG_FILE"
         _manage_service restart >/dev/null 2>&1 || true
@@ -2485,10 +2538,12 @@ _delete_relay() {
     # 处理全部删除
     if [[ "$choice" == "A" || "$choice" == "a" ]]; then
         _warn "即将删除所有 $((i-1)) 个中转路由！"
-        read -p "  确认删除所有? (yes/N): " confirm_all
-        if [[ "$confirm_all" == "yes" ]]; then
+        read -p "  确认删除所有? (y/yes/N): " confirm_all
+        if [[ "${confirm_all,,}" == "y" || "${confirm_all,,}" == "yes" ]]; then
             _info "正在批量删除..."
             _clear_all_relays
+        else
+            _info "已取消批量删除。"
         fi
         return
     fi
@@ -3954,8 +4009,8 @@ _menu() {
             4) _view_relays ;;
             5) _delete_relay ;;
             6) _modify_relay_port ;;
-            7) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn;
-               if [ "$cn" == "y" ]; then
+            7) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/yes/N): " cn;
+               if [[ "${cn,,}" == "y" || "${cn,,}" == "yes" ]]; then
                    _clear_all_relays
                fi ;;
             0) break ;;

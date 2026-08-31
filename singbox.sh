@@ -11,7 +11,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/sunnyfancore/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
-# 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
+# 保留 sing-box 1.12/1.13 兼容环境变量；旧 DNS server 格式会在服务启动前自动迁移
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
 export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
 export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
@@ -2294,7 +2294,7 @@ _initialize_config_files() {
     "servers": [
       {
         "tag": "dns-local",
-        "address": "local",
+        "type": "local",
         "detour": "direct"
       }
     ],
@@ -2469,16 +2469,93 @@ _cleanup_legacy_config() {
     return 1
 }
 
+_migrate_dns_server_formats() {
+    # 将 sing-box 1.12 以前的 DNS address 格式迁移为 1.14.0 要求的 type/server 格式。
+    # 参数：无；返回 0 表示配置已迁移，返回 1 表示无需迁移或迁移失败。
+    if [ ! -f "$CONFIG_FILE" ]; then return 1; fi
+
+    local legacy_count
+    legacy_count=$(jq '[.dns.servers[]? | select((has("type") | not) and (.address? != null))] | length' "$CONFIG_FILE" 2>/dev/null) || return 1
+    [ "$legacy_count" -gt 0 ] 2>/dev/null || return 1
+
+    _warn "检测到旧版 DNS server 格式，正在迁移以兼容 sing-box 1.14.0..."
+    local tmp_file="${CONFIG_FILE}.dns-migrate.tmp.$$"
+    local backup_file="${CONFIG_FILE}.bak_dns_migrate_$(date +%Y%m%d_%H%M%S)"
+    if ! cp "$CONFIG_FILE" "$backup_file"; then
+        _error "无法创建 DNS 迁移备份，原配置未修改。"
+        return 1
+    fi
+
+    if jq '
+        def is_ip:
+            test("^(\\[[0-9A-Fa-f:]+\\]|[0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+)$");
+        def migrate_server:
+            if has("type") or (.address? == null) then .
+            else
+                . as $old |
+                (.address) as $address |
+                (if $address == "local" then
+                    {"type": "local"}
+                 elif $address == "fakeip" then
+                    {"type": "fakeip"}
+                 elif ($address | startswith("dhcp://")) then
+                    ($address | sub("^dhcp://"; "")) as $interface |
+                    ({"type": "dhcp"} + (if ($interface == "" or $interface == "auto") then {} else {"interface": $interface} end))
+                 elif ($address | test("^(https|h3)://")) then
+                    ($address | capture("^(?<type>https|h3)://(?<server>[^/]+)(?<path>/.*)?$")) as $endpoint |
+                    ({"type": $endpoint.type, "server": $endpoint.server} + (if ($endpoint.path? // "") != "" then {"path": $endpoint.path} else {} end))
+                 elif ($address | test("^(tcp|udp|tls|quic)://")) then
+                    ($address | capture("^(?<type>tcp|udp|tls|quic)://(?<server>[^/]+)")) as $endpoint |
+                    {"type": $endpoint.type, "server": $endpoint.server}
+                 else
+                    {"type": "udp", "server": $address}
+                 end) as $new |
+                ($old | del(.address, .strategy)) * $new |
+                if has("address_resolver") then .domain_resolver = .address_resolver | del(.address_resolver) else . end |
+                if has("address_strategy") then .domain_strategy = .address_strategy | del(.address_strategy) else . end |
+                if (.server? != null and ((.server | is_ip) | not) and (.domain_resolver? == null)) then .domain_resolver = "dns-bootstrap" else . end
+            end;
+        (.dns.servers // []) as $legacy_servers |
+        if (.dns.servers? | type) == "array" then
+            .dns.servers |= map(migrate_server)
+            | .dns.rules = ((.dns.rules // []) | map(
+                . as $rule |
+                ([$legacy_servers[]? | select((.tag? != null) and (.tag == $rule.server?) and (.strategy? != null)) | .strategy] | first) as $rule_strategy |
+                if ($rule_strategy != null and (.strategy? == null)) then .strategy = $rule_strategy else . end
+              ))
+            | if ((.dns.strategy // "") == "") then
+                ($legacy_servers | map(select(.strategy? != null) | .strategy) | first) as $global_strategy |
+                if ($global_strategy != null) then .dns.strategy = $global_strategy else . end
+              else . end
+            | if (any(.dns.servers[]?; .domain_resolver? == "dns-bootstrap") and (any(.dns.servers[]?; .tag? == "dns-bootstrap") | not)) then
+                .dns.servers = [{"tag": "dns-bootstrap", "type": "local", "detour": "direct"}] + .dns.servers
+              else . end
+        else . end
+    ' "$CONFIG_FILE" > "$tmp_file" && [ -s "$tmp_file" ]; then
+        mv "$tmp_file" "$CONFIG_FILE"
+        _success "DNS server 格式迁移完成，备份文件：${backup_file}"
+        return 0
+    fi
+
+    _error "DNS server 格式迁移失败，原配置未修改。"
+    rm -f "$tmp_file"
+    return 1
+}
+
 _check_and_fix_dns() {
-    # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
-    # 3. 为未设置策略的旧配置补充 prefer_ipv4；保留用户在 DNS 菜单中明确选择的策略
-    if [ ! -f "$CONFIG_FILE" ]; then return; fi
+    # 热修复：1.迁移旧 DNS server 格式，2.补充缺失的 DNS 模块，3.清除可能造成路由死循环的 auto_detect_interface。
+    # 参数：无；返回 0 表示配置有改动，返回 1 表示无需改动。
+    # 4. 为未设置策略的旧配置补充 prefer_ipv4；保留用户在 DNS 菜单中明确选择的策略
+    if [ ! -f "$CONFIG_FILE" ]; then return 1; fi
+
+    local needs_restart=false
+    if _migrate_dns_server_formats; then
+        needs_restart=true
+    fi
     
     local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
     local has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
     local dns_strategy=$(jq -r '.dns.strategy // ""' "$CONFIG_FILE" 2>/dev/null)
-    local needs_restart=false
-    
     if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ]; then
         _warn "检测到 DNS/路由配置需要兼容性修复，正在自动处理..."
         
@@ -2487,7 +2564,7 @@ _check_and_fix_dns() {
             if has("dns") then . else . + {
                 "dns": {
                     "servers": [
-                        {"tag": "dns-local", "address": "local", "detour": "direct"}
+                        {"tag": "dns-local", "type": "local", "detour": "direct"}
                     ],
                     "rules": [{"outbound": "any", "server": "dns-local"}],
                     "strategy": "prefer_ipv4"
@@ -4819,6 +4896,8 @@ _check_config() {
 }
 
 _apply_dns_config() {
+    # 将 DNS 菜单输入转换为 sing-box 1.14.0 的新 DNS server 对象并保存。
+    # 参数：$1 为 DNS 地址，$2 为解析策略；返回 0 表示保存成功。
     local dns_address="$1"
     local dns_strategy="$2"
     local tmp_file="${CONFIG_FILE}.dns.tmp.$$"
@@ -4826,14 +4905,34 @@ _apply_dns_config() {
     local check_result
 
     if ! jq --arg address "$dns_address" --arg strategy "$dns_strategy" '
+        def is_ip:
+            test("^(\\[[0-9A-Fa-f:]+\\]|[0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+)$");
+        def with_domain_resolver($server):
+            if (($server | is_ip) | not) then {"domain_resolver": "dns-bootstrap"} else {} end;
+        def make_server($value):
+            if $value == "local" then
+                {"tag": "dns-local", "type": "local", "detour": "direct"}
+            elif $value == "fakeip" then
+                {"tag": "dns-local", "type": "fakeip", "detour": "direct"}
+            elif ($value | startswith("dhcp://")) then
+                ($value | sub("^dhcp://"; "")) as $interface |
+                ({"tag": "dns-local", "type": "dhcp", "detour": "direct"} + (if ($interface == "" or $interface == "auto") then {} else {"interface": $interface} end))
+            elif ($value | test("^(https|h3)://")) then
+                ($value | capture("^(?<type>https|h3)://(?<server>[^/]+)(?<path>/.*)?$")) as $endpoint |
+                ({"tag": "dns-local", "type": $endpoint.type, "server": $endpoint.server, "detour": "direct"} + (if ($endpoint.path? // "") != "" then {"path": $endpoint.path} else {} end) + with_domain_resolver($endpoint.server))
+            elif ($value | test("^(tcp|udp|tls|quic)://")) then
+                ($value | capture("^(?<type>tcp|udp|tls|quic)://(?<server>[^/]+)")) as $endpoint |
+                ({"tag": "dns-local", "type": $endpoint.type, "server": $endpoint.server, "detour": "direct"} + with_domain_resolver($endpoint.server))
+            else
+                ({"tag": "dns-local", "type": "udp", "server": $value, "detour": "direct"} + with_domain_resolver($value))
+            end;
         .dns = {
-            "servers": [
-                {
-                    "tag": "dns-local",
-                    "address": $address,
-                    "detour": "direct"
-                }
-            ],
+            "servers": (make_server($address) as $server |
+                if ($server.domain_resolver? != null) then
+                    [{"tag": "dns-bootstrap", "type": "local", "detour": "direct"}, $server]
+                else
+                    [$server]
+                end),
             "rules": [
                 {
                     "outbound": "any",
@@ -4867,10 +4966,12 @@ _apply_dns_config() {
 }
 
 _dns_config_menu() {
+    # 交互式管理 DNS server 和解析策略，兼容新旧配置的显示。
+    # 参数：无；函数通过菜单修改 CONFIG_FILE 中的 DNS 配置。
     local current_address current_strategy choice dns_address dns_strategy
 
     while true; do
-        current_address=$(jq -r '.dns.servers[0].address // "未设置"' "$CONFIG_FILE" 2>/dev/null)
+        current_address=$(jq -r '.dns.servers[0].address // .dns.servers[0].server // (.dns.servers[0].type // "未设置")' "$CONFIG_FILE" 2>/dev/null)
         current_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "$CONFIG_FILE" 2>/dev/null)
         [ -z "$current_address" ] || [ "$current_address" = "null" ] && current_address="未设置"
         [ -z "$current_strategy" ] || [ "$current_strategy" = "null" ] && current_strategy="prefer_ipv4"
@@ -5454,6 +5555,8 @@ _install_or_update_singbox() {
 
 # 执行 sing-box 核心的安装/更新
 _do_update_singbox() {
+    # 安装或更新 sing-box 核心，并在重启服务前迁移和校验配置。
+    # 参数：无；返回 0 表示核心与服务处理成功，返回 1 表示安装或配置校验失败。
     _info "--- 安装/更新 Sing-box 核心 ---"
     _install_dependencies true
     _install_sing_box
@@ -5469,6 +5572,17 @@ _do_update_singbox() {
         if [ ! -s "${SINGBOX_DIR}/relay.json" ]; then
             echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
         fi
+
+        # 1.14.0 已移除旧 DNS server 格式，必须在重启服务前完成迁移。
+        _check_and_fix_dns || true
+        local validation_result
+        validation_result=$(${SINGBOX_BIN} check -c "${CONFIG_FILE}" -c "${SINGBOX_DIR}/relay.json" 2>&1)
+        if [ $? -ne 0 ]; then
+            _error "sing-box 配置校验失败，已保留配置文件但暂不重启服务："
+            echo "$validation_result"
+            return 1
+        fi
+
         _create_service_files
         _setup_log_cleanup
         _info "正在启动/重启 [主] 服务 (sing-box)..."
